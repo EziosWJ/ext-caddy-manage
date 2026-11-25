@@ -1,0 +1,7 @@
+{
+  "cn.ezios.ecm": {
+    "units": ["caddy.service"],
+    "actions": ["list", "get", "start", "stop", "restart", "logs"],
+    "elevate": ["start", "stop", "restart"]
+  }
+}

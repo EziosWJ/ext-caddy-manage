@@ -1,0 +1,21 @@
+# ext-caddy-manage 服务提权规则（示例）。
+#
+# 仅允许运行 Extension Host 的账号以 root 执行 caddy.service 的
+# start / stop / restart 三个完整命令。先把下面的 godesk 替换为宿主账号，再安装：
+#   sed 's/^godesk /<宿主账号> /' sudoers.example > /tmp/ext-caddy-manage.sudoers
+#   sudo visudo -cf /tmp/ext-caddy-manage.sudoers
+#   sudo install -o root -g root -m 0440 /tmp/ext-caddy-manage.sudoers /etc/sudoers.d/ext-caddy-manage
+#   rm -f /tmp/ext-caddy-manage.sudoers
+#
+# 规则必须与 host.services 实际执行的命令逐字匹配（路径、参数顺序、-- 均不能变）：
+#   sudo -n -k -u root -- /usr/bin/systemctl start --no-ask-password -- caddy.service
+#
+# 读取 journal 日志不需要提权，依赖宿主账号加入 systemd-journal 组：
+#   sudo usermod -aG systemd-journal godesk
+
+Cmnd_Alias CADDY_SERVICE = \
+  /usr/bin/systemctl start --no-ask-password -- caddy.service, \
+  /usr/bin/systemctl stop --no-ask-password -- caddy.service, \
+  /usr/bin/systemctl restart --no-ask-password -- caddy.service
+
+godesk ALL=(root) NOPASSWD: CADDY_SERVICE

@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "cn.ezios.ecm",
+  "name": "Caddy 管理",
+  "version": "0.1.0",
+  "minHostVersion": "0.3.0",
+  "hostApi": {
+    "min": 1,
+    "max": 1
+  },
+  "entry": {
+    "web": "web/index.html",
+    "lua": "lua/init.lua"
+  },
+  "capabilities": [
+    "storage",
+    "services"
+  ],
+  "config": {
+    "caddyBinary": {
+      "type": "string",
+      "default": "/opt/caddy/caddy"
+    },
+    "mainConfig": {
+      "type": "string",
+      "default": "/opt/caddy/config/Caddyfile"
+    },
+    "snippetDir": {
+      "type": "string",
+      "default": "/opt/caddy/config/conf.d"
+    },
+    "sitesRoot": {
+      "type": "string",
+      "default": "/opt/caddy/sites"
+    },
+    "serviceUnit": {
+      "type": "string",
+      "default": "caddy.service"
+    },
+    "logLines": {
+      "type": "number",
+      "format": "integer",
+      "default": 500,
+      "min": 100,
+      "max": 2000
+    },
+    "certProbeHours": {
+      "type": "number",
+      "format": "integer",
+      "default": 6,
+      "min": 1,
+      "max": 168
+    },
+    "backupKeep": {
+      "type": "number",
+      "format": "integer",
+      "default": 100,
+      "min": 10,
+      "max": 1000
+    }
+  }
+}
