@@ -1,12 +1,10 @@
 import api from "../api.js";
 import {
-  badge,
   banner,
   button,
   buttonBusy,
   codeBlock,
   confirmDialog,
-  conflictDialog,
   el,
   errorBlock,
   feedback,
@@ -20,14 +18,19 @@ import {
   section,
   switchField,
   textareaField,
+  tabs,
   toast,
 } from "../components.js";
 import { byteLength, fmtBytes, fmtDateTime, fmtRelative } from "../format.js";
 
+import {
+  configurationToolbar, rememberEditorMode, savedEditorMode, saveReviewedForm, viewConfiguration,
+} from "./configuration.js";
+
 function backupReasonLabel(reason) {
   switch (reason) {
     case "global":
-      return "全局表单";
+      return "全局配置";
     case "raw":
       return "原文保存";
     case "restore":
@@ -42,6 +45,7 @@ function backupReasonLabel(reason) {
 }
 
 export async function mount(root, ctx) {
+  const modeKey = `ecm:editor:${location.pathname}:global`;
   const page = el("div", { class: "ecm-page" });
   root.append(page);
 
@@ -57,6 +61,9 @@ export async function mount(root, ctx) {
   let refs = {};
   let ui = {};
   let rawEditorInstance = null;
+  let activeTab = "config";
+  let mode = savedEditorMode(modeKey);
+  let reviewForm = false;
 
   const beforeUnload = (event) => {
     if (!dirty) return;
@@ -167,36 +174,27 @@ export async function mount(root, ctx) {
 
   function buildFormSection() {
     refs = {};
-    const disabled = !detail.hasMarkers;
-    const body = el("div", { class: "ecm-stack" });
-    if (!detail.hasMarkers) {
-      body.append(
-        feedback(
-          "未找到受管全局块，表单不可用。可以直接编辑主 Caddyfile 原文，或在诊断页生成初始配置。",
-          "warning",
-        ),
-      );
-    }
+    const stagingWarning = feedback("浏览器不会信任 Let’s Encrypt 测试证书。", "warning");
+    stagingWarning.hidden = !gform.staging;
     const emailField = inputField({
-      label: "ACME 邮箱",
+      label: "证书账户邮箱（选填）",
+      hint: "Caddy 创建 ACME 账户时使用的联系邮箱。",
       value: gform.email,
       type: "email",
       mono: true,
       placeholder: "you@example.com",
-      hint: "写入全局块的 email 指令；留空则不生成。",
-      disabled,
       onInput: (value) => {
         gform.email = value;
         updateDirty();
       },
     });
     const stagingField = switchField({
-      label: "使用 Let's Encrypt staging CA",
-      hint: "staging 证书不会被浏览器信任，仅用于测试。正式上线前必须关闭。",
+      label: "使用 Let’s Encrypt 测试环境",
+      hint: "用于测试证书申请流程。浏览器不会信任测试证书。",
       checked: gform.staging,
-      disabled,
       onChange: (checked) => {
         gform.staging = checked;
+        stagingWarning.hidden = !checked;
         updateDirty();
       },
     });
@@ -205,7 +203,6 @@ export async function mount(root, ctx) {
       value: gform.extra,
       rows: 10,
       mono: true,
-      disabled,
       placeholder: "# 每行一条全局指令\nservers {\n\ttrusted_proxies 10.0.0.0/8\n}",
       hint: "写入受管块内部；不要包含受管标记。上限 46 KiB。",
       onInput: (value) => {
@@ -223,39 +220,24 @@ export async function mount(root, ctx) {
     };
     updateExtraCount();
 
-    if (gform.staging) {
-      body.append(
-        feedback("当前使用 Let's Encrypt staging，签发的证书不会被浏览器信任。", "warning"),
-      );
-    }
-    body.append(
-      el("div", { class: "ecm-form-grid" }, emailField.root, stagingField.root, extraField.root, extraCount),
-      metaGrid([
-        { label: "Admin 端点", value: gform.admin || "未配置", mono: true },
-        { label: "主 Caddyfile", value: detail.path || "—", mono: true },
-      ]),
-    );
-
-    const saveBtn = button("保存并重载", {
-      variant: "primary",
-      icon: "save",
-      disabled,
-      onClick: () => saveForm(saveBtn),
-    });
-    ui.saveBtn = saveBtn;
-    body.append(el("div", { class: "ecm-toolbar" }, saveBtn));
-
     refs.email = emailField;
     refs.staging = stagingField;
     refs.extra = extraField;
 
-    const card = section({
-      title: "受管全局块",
-      description: "只重写 # >>> ext-caddy-manage:global 与 # <<< 之间的内容，块外内容逐字节保留。",
-      children: body,
+    return section({
+      title: "全局设置",
+      help: "表单只写入主 Caddyfile 中受管标记包围的全局块。",
+      children: el("div", { class: "ecm-stack" },
+        el("p", { class: "ecm-hint" }, "公网域名的 HTTPS 由各站点设置，Caddy 会自动申请和续期。"),
+        stagingWarning,
+        el("details", { class: "ecm-details" },
+          el("summary", null, "高级设置"),
+          el("div", { class: "ecm-form-grid ecm-details-body" },
+            emailField.root, stagingField.root, extraField.root, extraCount,
+          ),
+        ),
+      ),
     });
-    if (disabled) card.classList.add("ecm-is-disabled");
-    return card;
   }
 
   function highlightField(path, message) {
@@ -269,79 +251,53 @@ export async function mount(root, ctx) {
     if (!fieldApi) return;
     if (typeof fieldApi.setError === "function") fieldApi.setError(message || "该字段无效。");
     if (fieldApi.control) {
+      fieldApi.control.closest("details")?.setAttribute("open", "");
       fieldApi.control.focus();
       fieldApi.control.scrollIntoView({ block: "center", behavior: "smooth" });
     }
   }
 
-  async function saveForm(saveBtn, opts = {}) {
-    if (saving || !detail.hasMarkers) return;
-    let force = Boolean(opts.force);
-    if (detail.drift && !opts.skipDriftConfirm && !force) {
-      const ok = await confirmDialog({
-        title: "覆盖磁盘上的全局块？",
-        message:
-          "主 Caddyfile 的受管块已被外部修改。用表单保存会重写受管块并覆盖这些修改；块外内容仍会保留。",
-        confirmLabel: "覆盖并保存",
-        danger: true,
-      });
-      if (!ok) return;
-      force = true;
-    }
-    if (rawDirty && !opts.skipRawConfirm) {
-      const ok = await confirmDialog({
-        title: "丢弃原文编辑？",
-        message: "主 Caddyfile 原文编辑器中有未保存的修改，保存表单会覆盖并丢弃这些修改。",
-        confirmLabel: "继续保存",
-        danger: true,
-      });
-      if (!ok) return;
-    }
+  async function saveForm() {
+    if (saving || mode === "raw" || !detail.hasMarkers) return;
     saving = true;
-    buttonBusy(saveBtn, true, "保存中…");
-    if (rawEditorInstance) rawEditorInstance.setDisabled(true);
-    setFormControlsDisabled(true);
+    setSavingUi(true);
     try {
-      let result;
-      try {
-        result = await api.saveGlobal(gform, detail.raw, force);
-      } catch (error) {
-        if (error && error.code === "conflict" && !force) {
-          const choice = await conflictDialog({
-            title: "检测到外部修改",
-            message: error.message || "主 Caddyfile 已与基线上不同。",
-            details: error.details,
-          });
-          if (choice === "disk") {
-            await reloadGlobal();
-            toast("已载入磁盘内容，本地表单修改已丢弃。", "info");
-            return;
-          }
-          if (choice !== "overwrite") return;
-          force = true;
-          result = await api.saveGlobal(gform, detail.raw, true);
-        } else {
-          throw error;
-        }
-      }
-      dirty = false;
-      const message =
-        result && result.apply && result.apply.message ? result.apply.message : "全局配置已保存。";
-      toast(message, "success");
+      const result = await saveReviewedForm({
+        baseline: detail.raw,
+        review: reviewForm || detail.drift,
+        preview: (baseline) => api.previewGlobal(gform, baseline),
+        save: (baseline) => api.saveGlobal(gform, baseline, false),
+        reload: reloadGlobal,
+        confirmLabel: "保存并重载",
+      });
+      if (!result) return;
+      rememberEditorMode(modeKey, "form");
+      reviewForm = false;
+      initialSnapshot = JSON.stringify(gform);
+      updateDirty();
+      toast(result?.apply?.message || "全局配置已保存。", "success");
       await reloadGlobal();
-      if (typeof ctx.refreshHealth === "function") ctx.refreshHealth();
+      ctx.refreshHealth?.();
     } catch (error) {
       setFormControlsDisabled(false);
-      if (error && error.details && typeof error.details.field === "string") {
-        highlightField(error.details.field, error.message);
-      }
+      if (typeof error?.details?.field === "string") highlightField(error.details.field, error.message);
       showTopError(error);
     } finally {
       saving = false;
-      if (saveBtn.isConnected) buttonBusy(saveBtn, false);
-      if (rawEditorInstance) rawEditorInstance.setDisabled(false);
-      setFormControlsDisabled(false);
+      setSavingUi(false);
     }
+  }
+
+  function setSavingUi(next, { raw = false } = {}) {
+    if (!raw) {
+      if (ui.saveBtn) buttonBusy(ui.saveBtn, next, "保存中…");
+      rawEditorInstance?.setDisabled(next);
+    }
+    if (ui.refreshBtn) ui.refreshBtn.disabled = next;
+    for (const control of page.querySelectorAll(".ecm-config-toolbar button, .ecm-file-action")) {
+      control.disabled = next;
+    }
+    setFormControlsDisabled(next);
   }
 
   function buildRawSection() {
@@ -349,30 +305,26 @@ export async function mount(root, ctx) {
       value: detail.raw || "",
       baseline: detail.raw || "",
       maxBytes: 48 * 1024,
-      saveLabel: "保存主配置",
-      saveVariant: detail.hasMarkers ? "secondary" : "primary",
+      saveLabel: "保存并重载",
+      saveInHeader: true,
       validateName: "主配置",
       onValidate: (content) => api.validateMain(content),
       onFormat: (content) => api.fmt(content),
       onSave: (content, baseline, force) => api.saveGlobalRaw(content, baseline, force),
       onConflictReload: async () => {
         await reloadGlobal();
-        if (typeof ctx.refreshHealth === "function") ctx.refreshHealth();
+        ctx.refreshHealth?.();
       },
-      onBusyChange: (busy) => setFormControlsDisabled(busy),
-      onBeforeSave: async () => {
-        if (!formDirty()) return true;
-        return confirmDialog({
-          title: "丢弃未保存的表单修改？",
-          message: "保存原文会刷新页面，并丢弃全局表单中尚未保存的修改。",
-          confirmLabel: "保存原文",
-          danger: true,
-        });
+      onBusyChange: (busy) => {
+        saving = busy;
+        setSavingUi(busy, { raw: true });
       },
-      onSaved: async () => {
-        toast("主 Caddyfile 已保存并应用。", "success");
+      onSaved: async (result) => {
+        mode = "raw";
+        rememberEditorMode(modeKey, "raw");
+        toast(result?.apply?.message || "主 Caddyfile 已保存。", "success");
         await reloadGlobal();
-        if (typeof ctx.refreshHealth === "function") ctx.refreshHealth();
+        ctx.refreshHealth?.();
       },
       onDirtyChange: (value) => {
         rawDirty = value;
@@ -382,7 +334,7 @@ export async function mount(root, ctx) {
     rawEditorInstance = editor;
     return section({
       title: "主 Caddyfile（原文）",
-      description: "直接编辑完整主配置；保存前会整体校验，受管块外内容由你自行维护。",
+      help: "这里可以编辑整个主配置，保存前会整体校验。",
       children: [editor.root],
     });
   }
@@ -420,7 +372,7 @@ export async function mount(root, ctx) {
   }
 
   async function restoreBackup(item) {
-    if (!(await confirmDiscard())) return;
+    if (saving || !(await confirmDiscard())) return;
     const ok = await confirmDialog({
       title: "恢复备份",
       message: [
@@ -431,6 +383,8 @@ export async function mount(root, ctx) {
       danger: true,
     });
     if (!ok) return;
+    saving = true;
+    setSavingUi(true);
     toast("正在恢复备份…", "info");
     try {
       const result = await api.restoreBackup(item.name);
@@ -442,15 +396,18 @@ export async function mount(root, ctx) {
     } catch (error) {
       showTopError(error);
       toast(error.message || "恢复备份失败", "danger");
+    } finally {
+      saving = false;
+      setSavingUi(false);
     }
   }
 
   function buildBackupsAside() {
     const backups = Array.isArray(detail.backups) ? detail.backups : [];
-    const card = section({ title: "备份", description: "最近 10 份主 Caddyfile 备份。", children: [] });
+    const card = section({ title: "备份", help: "保存或恢复时自动备份，最多保留 10 份。", children: [] });
     const body = card.querySelector(".ecm-card-body");
     if (backups.length === 0) {
-      body.append(el("p", { class: "ecm-hint" }, "暂无备份；保存或恢复时会自动生成。"));
+      body.append(el("p", { class: "ecm-hint" }, "暂无备份"));
       return card;
     }
     const list = el("div", { class: "ecm-backup-list" });
@@ -486,16 +443,23 @@ export async function mount(root, ctx) {
   }
 
   async function adoptDisk() {
-    if (!(await confirmDiscard())) return;
+    if (saving || !(await confirmDiscard())) return;
+    saving = true;
+    setSavingUi(true);
     toast("正在应用磁盘内容…", "info");
     try {
-      const result = await api.saveGlobalRaw(detail.raw || "", detail.raw || "", true);
+      const result = await api.saveGlobalRaw(detail.raw || "", detail.raw || "", false);
+      mode = "raw";
+      rememberEditorMode(modeKey, "raw");
       const message =
         result && result.apply && result.apply.message ? result.apply.message : "已采用磁盘内容。";
       toast(message, "success");
       await reloadGlobal();
     } catch (error) {
       showTopError(error);
+    } finally {
+      saving = false;
+      setSavingUi(false);
     }
   }
 
@@ -505,8 +469,8 @@ export async function mount(root, ctx) {
       nodes.push(
         banner({
           tone: "warning",
-          title: "未找到受管全局块；表单已禁用，仅可编辑原文",
-          message: "在诊断页可以生成带受管标记的初始配置；生成前会备份现有主 Caddyfile。",
+          title: "当前文件使用原文编辑",
+          message: "表单需要受管标记。可在诊断页生成初始配置，生成前会备份现有主 Caddyfile。",
           actions: linkButton("前往诊断", "#/diagnostics", { variant: "secondary", compact: true }),
         }),
       );
@@ -516,44 +480,21 @@ export async function mount(root, ctx) {
         banner({
           tone: "warning",
           title: "主 Caddyfile 不存在",
-          message: "保存全局表单或原文前，需要先创建主配置文件。",
+          message: "可在原文编辑器中保存新配置，或通过诊断页生成初始配置。",
           actions: linkButton("前往诊断", "#/diagnostics", { variant: "secondary", compact: true }),
         }),
       );
     }
     if (detail.drift) {
-      const actions = [
-        button("以磁盘为准", {
-          variant: "secondary",
-          icon: "download",
-          compact: true,
-          onClick: () => adoptDisk(),
-        }),
-      ];
-      if (detail.hasMarkers) {
-        actions.push(
-          button("用表单覆盖", {
-            variant: "secondary",
-            icon: "upload",
-            compact: true,
-            onClick: async () => {
-              const ok = await confirmDialog({
-                title: "用表单覆盖受管块",
-                message: "按当前表单重写受管块并覆盖磁盘上的外部修改，块外内容保持不变。",
-                confirmLabel: "覆盖并保存",
-                danger: true,
-              });
-              if (!ok) return;
-              await saveForm(ui.saveBtn, { force: true, skipDriftConfirm: true });
-            },
-          }),
-        );
-      }
+      const actions = button("以磁盘为准", {
+        variant: "secondary", icon: "download", compact: true,
+        className: "ecm-file-action", onClick: adoptDisk,
+      });
       nodes.push(
         banner({
           tone: "warning",
-          title: "受管块已被外部修改",
-          message: "主 Caddyfile 的受管块内容与插件上次写入的基线不同。",
+          title: "主 Caddyfile 已被外部修改",
+          message: "当前文件与上次保存的版本不同。保存表单时会先显示差异。",
           actions,
         }),
       );
@@ -565,6 +506,31 @@ export async function mount(root, ctx) {
     refs = {};
     ui = {};
     rawEditorInstance = null;
+    const raw = !detail.hasMarkers || mode === "raw";
+    const configPanel = el("div", { class: "ecm-stack" },
+      configurationToolbar({
+        raw,
+        canEditForm: detail.hasMarkers,
+        view: () => viewConfiguration("主 Caddyfile", detail.raw),
+        switchMode: async () => {
+          if (saving || !(await confirmDiscard())) return;
+          mode = raw ? "form" : "raw";
+          if (raw) reviewForm = true;
+          initState();
+          render();
+          page.querySelector(".ecm-config-toolbar button")?.focus();
+        },
+      }),
+      raw ? buildRawSection() : buildFormSection(),
+      el("details", { class: "ecm-details" },
+        el("summary", null, "全局信息"),
+        el("div", { class: "ecm-details-body" }, metaGrid([
+          { label: "Admin 端点", value: gform.admin || "未配置", mono: true },
+          { label: "文件大小", value: detail.size ? fmtBytes(detail.size) : "—" },
+          { label: "受管标记", value: detail.hasMarkers ? "完整" : "缺失" },
+        ])),
+      ),
+    );
     const refreshBtn = button("", {
       variant: "ghost",
       icon: "refresh-cw",
@@ -572,48 +538,50 @@ export async function mount(root, ctx) {
       ariaLabel: "重新读取全局配置",
       title: "重新读取",
       onClick: async () => {
-        if (!(await confirmDiscard())) return;
-        await reloadGlobal();
+        if (saving || !(await confirmDiscard())) return;
+        saving = true;
+        setSavingUi(true);
+        try {
+          await reloadGlobal();
+        } finally {
+          saving = false;
+          setSavingUi(false);
+        }
       },
     });
-    const diagnosticsBtn = linkButton("诊断", "#/diagnostics", { variant: "secondary", compact: true });
+    ui.refreshBtn = refreshBtn;
+    const saveBtn = raw ? rawEditorInstance.saveButton : button("保存并重载", {
+      variant: "primary", icon: "save", onClick: saveForm,
+    });
+    ui.saveBtn = saveBtn;
     const header = pageHeader({
       title: "全局配置",
-      subtitle: el(
-        "span",
-        { class: "ecm-detail-sub" },
-        el("span", { class: "ecm-mono" }, detail.path || "主 Caddyfile"),
-        detail.drift ? badge("外部修改", "warning") : null,
-        detail.hasMarkers ? badge("受管块", "success") : badge("无受管标记", "warning"),
-      ),
-      actions: [refreshBtn, diagnosticsBtn],
+      subtitle: el("span", { class: "ecm-mono" }, detail.path || "主 Caddyfile"),
+      actions: [
+        refreshBtn,
+        linkButton("诊断", "#/diagnostics", { variant: "secondary", compact: true }),
+        saveBtn,
+      ],
     });
     dirtyIndicator = el("span", { class: "ecm-dirty", hidden: true }, "未保存");
-    const titleRow = header.querySelector(".ecm-page-title-row");
-    if (titleRow) titleRow.append(dirtyIndicator);
+    header.querySelector(".ecm-page-title-row").append(dirtyIndicator);
 
     topMessages = el("div", { class: "ecm-messages" });
-    const main = el("div", { class: "ecm-detail-main ecm-stack" });
-    const aside = el("aside", { class: "ecm-detail-aside ecm-stack" });
-    main.append(buildFormSection());
-    main.append(buildRawSection());
-    aside.append(
-      section({
-        title: "全局信息",
-        children: metaGrid([
-          { label: "是否存在", value: detail.exists ? "是" : "否" },
-          { label: "文件大小", value: detail.size ? fmtBytes(detail.size) : "—" },
-          { label: "受管标记", value: detail.hasMarkers ? "完整" : "缺失" },
-          { label: "最后写入", value: detail.lastContent ? "有基线" : "无基线" },
-        ]),
-      }),
-    );
-    aside.append(buildBackupsAside());
+    const items = [
+      { id: "config", label: "配置", panel: configPanel },
+      { id: "backups", label: "备份", panel: buildBackupsAside() },
+    ];
+    const navigation = tabs({
+      items, value: activeTab, label: "全局配置",
+      onChange: (id) => {
+        activeTab = id;
+        for (const item of items) item.panel.hidden = item.id !== id;
+        saveBtn.hidden = id !== "config";
+      },
+    });
+    const content = el("div", { class: "ecm-stack" },
+      topMessages, buildBanners(), navigation.root, items.map((item) => item.panel));
 
-    const content = el("div", { class: "ecm-stack" });
-    content.append(topMessages);
-    for (const node of buildBanners()) content.append(node);
-    content.append(el("div", { class: "ecm-detail-layout" }, main, aside));
     page.replaceChildren(header, content);
     updateDirty();
     ctx.setTitle("全局配置");

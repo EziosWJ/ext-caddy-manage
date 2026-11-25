@@ -100,12 +100,9 @@ local function reloadDecision()
   return "attempt", state
 end
 
--- Probe whether the Caddy admin endpoint accepts TCP connections. This is
--- only used when host.services cannot tell us whether Caddy is running (for
--- example without systemd grants). openssl is an existing plugin dependency.
-local function adminReachable(s)
+function M.adminAddress(s)
   local raw = fs.read(s.mainConfig)
-  if raw == nil then return false end
+  if raw == nil then return nil end
   local address = nil
   for _, line in ipairs(util.splitLines(raw)) do
     local value = string.match(line, "^%s*admin%s+(.+)$")
@@ -115,6 +112,15 @@ local function adminReachable(s)
     end
   end
   if address == nil or address == "" then address = "127.0.0.1:2019" end
+  return address
+end
+
+-- Probe whether the Caddy admin endpoint accepts TCP connections. This is
+-- only used when host.services cannot tell us whether Caddy is running (for
+-- example when the systemd backend is unavailable).
+local function adminReachable(s)
+  local address = M.adminAddress(s)
+  if address == nil then return false end
   address = util.trim(address)
   address = address:gsub("^https?://", "")
   if address == "off" then return false end
@@ -135,7 +141,7 @@ end
 
 -- Reload after a validated write. Returns an apply table or nil, caddy error.
 -- Admin-unreachable failures are treated as saved-only because the config was
--- already validated; this keeps the plugin usable without systemd grants.
+-- already validated.
 function M.reloadAfterChange(wasRunningHint)
   local s = settings.load()
   local action
@@ -285,6 +291,23 @@ function M.parseGlobal(raw)
   res.admin = admin
   res.extra = table.concat(extraLines, "\n")
   return res
+end
+
+-- Legacy host-only site addresses inherit the Caddyfile's HTTP(S) ports.
+function M.httpPorts(raw)
+  local ports = { http = 80, https = 443 }
+  if type(raw) ~= "string" then return ports end
+  local parsed = M.parseGlobal(raw)
+  local source = parsed and parsed.hasMarkers and parsed.block or raw
+  for _, line in ipairs(util.splitLines(source)) do
+    local protocol, port = util.trim(line):match("^(https?)_port%s+(%d+)$")
+    if not protocol then
+      protocol, port = util.trim(line):match("^(https?)_port%s+(%d+)%s+#")
+    end
+    port = tonumber(port)
+    if protocol and port and port >= 1 and port <= 65535 then ports[protocol] = port end
+  end
+  return ports
 end
 
 function M.renderGlobal(form)
@@ -1025,6 +1048,19 @@ function M.writeMain(content, opts)
   return { path = s.mainConfig, bytes = #content, backup = backupName, apply = applyRes }
 end
 
+function M.mergeGlobal(raw, form)
+  local parsed, perr = M.parseGlobal(raw)
+  if not parsed then return nil, perr end
+  if not parsed.hasMarkers then
+    return fail("markers_missing", "未找到受管全局块标记，请先在诊断页生成初始配置或手动添加标记", {
+      mainConfig = settings.load().mainConfig,
+    })
+  end
+  local block, rerr = M.renderGlobal(form)
+  if not block then return nil, rerr end
+  return parsed.before .. block .. parsed.after
+end
+
 function M.writeGlobal(form, opts)
   opts = opts or {}
   form = form or {}
@@ -1038,16 +1074,8 @@ function M.writeGlobal(form, opts)
       mainConfig = s.mainConfig,
     })
   end
-  local parsed, perr = M.parseGlobal(raw)
-  if not parsed then return nil, perr end
-  if not parsed.hasMarkers then
-    return fail("markers_missing", "未找到受管全局块标记，请先在诊断页生成初始配置或手动添加标记", {
-      mainConfig = s.mainConfig,
-    })
-  end
-  local block, rerr = M.renderGlobal(form)
-  if not block then return nil, rerr end
-  local newRaw = parsed.before .. block .. parsed.after
+  local newRaw, err = M.mergeGlobal(raw, form)
+  if not newRaw then return nil, err end
   local res, werr = M.writeMain(newRaw, {
     baseline = opts.baseline,
     force = opts.force,

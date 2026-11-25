@@ -142,6 +142,14 @@ local function validDomain(d)
   return true
 end
 
+-- An IPv4 listener address has an explicit port and always uses HTTP.
+local function listenerAddress(address)
+  local port = address:match("^0%.0%.0%.0:(%d+)$")
+  if port then return port, "0.0.0.0" end
+  port = address:match("^127%.0%.0%.1:(%d+)$") or address:match("^localhost:(%d+)$")
+  if port then return port, "127.0.0.1" end
+end
+
 local validIPv6
 
 local function validUpstream(s)
@@ -230,6 +238,49 @@ validIPv6 = function(s)
   if leftGroups == nil or rightGroups == nil then return false end
   return leftGroups + rightGroups < 8
 end
+
+local function canonicalIP(address)
+  if validIPv4(address) then
+    for part in address:gmatch("%d+") do
+      if #part > 1 and part:sub(1, 1) == "0" then return nil end
+    end
+    return address
+  end
+  if not validIPv6(address) then return nil end
+  local function groups(side)
+    local out = {}
+    for part in side:gmatch("[^:]+") do
+      if part:find(".", 1, true) then
+        local ip = {}
+        for octet in part:gmatch("%d+") do
+          if #octet > 1 and octet:sub(1, 1) == "0" then return nil end
+          ip[#ip + 1] = tonumber(octet)
+        end
+        out[#out + 1] = string.format("%x", ip[1] * 256 + ip[2])
+        out[#out + 1] = string.format("%x", ip[3] * 256 + ip[4])
+      else
+        out[#out + 1] = string.format("%x", tonumber(part, 16))
+      end
+    end
+    return out
+  end
+  local left, right = address:match("^(.-)::(.*)$")
+  local all, tail = groups(left or address), groups(right or "")
+  if not all or not tail then return nil end
+  if right then
+    for i = #all + 1, 8 - #tail do all[i] = "0" end
+    for _, part in ipairs(tail) do all[#all + 1] = part end
+  end
+  local start, count, run = 0, 1, 0
+  for i, part in ipairs(all) do
+    run = part == "0" and run + 1 or 0
+    if run > count then start, count = i - run + 1, run end
+  end
+  if start == 0 then return table.concat(all, ":") end
+  return table.concat(all, ":", 1, start - 1) .. "::" .. table.concat(all, ":", start + count)
+end
+
+M.canonicalIP = canonicalIP
 
 local function validIPEntry(s)
   if type(s) ~= "string" or s == "" then return false end
@@ -608,6 +659,281 @@ local function normalizeSecurity(sec)
   return out, nil
 end
 
+local function normalizeStatic(st, field, creating)
+  if st == nil then st = {} end
+  if type(st) ~= "table" or not isObjectTable(st) then
+    return nil, bad(field, "静态站配置必须是对象")
+  end
+  local root = ""
+  if st.root ~= nil then
+    if type(st.root) ~= "string" then return nil, bad(field .. ".root", "根目录必须是字符串") end
+    root = st.root
+  end
+  local browse = false
+  if st.browse ~= nil then
+    if type(st.browse) ~= "boolean" then return nil, bad(field .. ".browse", "目录浏览开关必须是布尔值") end
+    browse = st.browse
+  end
+  local spa = false
+  if st.spa ~= nil then
+    if type(st.spa) ~= "boolean" then return nil, bad(field .. ".spa", "SPA 开关必须是布尔值") end
+    spa = st.spa
+  end
+  if util.trim(root) == "" then
+    if not creating then return nil, bad(field .. ".root", "根目录不能为空") end
+    root = ""
+  else
+    if #root > 4096 then return nil, bad(field .. ".root", "根目录不能超过 4096 个字符") end
+    if not util.isAbsolute(root) then return nil, bad(field .. ".root", "根目录必须是绝对路径") end
+    if hasCrLfNul(root) then return nil, bad(field .. ".root", "根目录不能包含换行或 NUL 字符") end
+  end
+  return { root = root, browse = browse, spa = spa }
+end
+
+local function normalizeProxy(p, field)
+  if type(p) ~= "table" or not isObjectTable(p) then
+    return nil, bad(field, "反向代理配置必须是对象")
+  end
+
+  local okUps, upCount = isListT(p.upstreams)
+  if not okUps then return nil, bad(field .. ".upstreams", "上游必须是数组") end
+  if upCount < 1 then return nil, bad(field .. ".upstreams", "至少需要一个上游") end
+  if upCount > M.MAX_UPSTREAMS then
+    return nil, bad(field .. ".upstreams", "上游数量不能超过 " .. M.MAX_UPSTREAMS .. " 个")
+  end
+  local upstreams = util.array({})
+  local sawBare, sawHttp, sawHttps = false, false, false
+  for i = 1, upCount do
+    local raw = p.upstreams[i]
+    if type(raw) ~= "string" then return nil, bad(field .. ".upstreams", "上游必须是字符串") end
+    local u = util.trim(raw)
+    if not validUpstream(u) then
+      return nil, bad(field .. ".upstreams", "上游格式无效（仅支持 host:port、[v6]:port 或 http(s)://host:port）：" .. raw)
+    end
+    if u:sub(1, 8) == "https://" then
+      sawHttps = true
+    elseif u:sub(1, 7) == "http://" then
+      sawHttp = true
+    else
+      sawBare = true
+    end
+    upstreams[#upstreams + 1] = u
+  end
+  -- Caddy's reverse_proxy accepts either all scheme-less upstreams or one
+  -- explicit scheme for all of them. Mixing forms is order-sensitive and can
+  -- change TLS behavior, so reject it instead of guessing.
+  if (sawBare and (sawHttp or sawHttps)) or (sawHttp and sawHttps) then
+    return nil, bad(field .. ".upstreams",
+      "同一反向代理的上游必须全部不带 scheme，或全部使用相同的 http:// / https://")
+  end
+
+  local lbPolicy = "round_robin"
+  if p.lbPolicy ~= nil then
+    if type(p.lbPolicy) ~= "string" or not LB_SET[p.lbPolicy] then
+      return nil, bad(field .. ".lbPolicy", "负载均衡策略无效")
+    end
+    lbPolicy = p.lbPolicy
+  end
+
+  local h = p.health
+  if h == nil then h = {} end
+  if type(h) ~= "table" or not isObjectTable(h) then
+    return nil, bad(field .. ".health", "健康检查配置必须是对象")
+  end
+  local healthEnabled = false
+  if h.enabled ~= nil then
+    if type(h.enabled) ~= "boolean" then return nil, bad(field .. ".health.enabled", "健康检查开关必须是布尔值") end
+    healthEnabled = h.enabled
+  end
+  local healthUri = "/health"
+  if h.uri ~= nil then
+    if type(h.uri) ~= "string" then return nil, bad(field .. ".health.uri", "健康检查路径必须是字符串") end
+    healthUri = h.uri
+  end
+  if #healthUri > 1024 then return nil, bad(field .. ".health.uri", "健康检查路径不能超过 1024 个字符") end
+  if healthUri:sub(1, 1) ~= "/" or healthUri:find("%s") or hasControl(healthUri)
+    or healthUri:find("{", 1, true) or healthUri:find("}", 1, true) then
+    return nil, bad(field .. ".health.uri", "健康检查路径必须以 / 开头且不能包含空白或花括号")
+  end
+  local healthInterval = "10s"
+  if h.interval ~= nil then
+    if not validDuration(h.interval) then return nil, bad(field .. ".health.interval", "健康检查间隔无效（须大于 0 且不超过 86400s）") end
+    healthInterval = h.interval
+  end
+  local healthTimeout = "3s"
+  if h.timeout ~= nil then
+    if not validDuration(h.timeout) then return nil, bad(field .. ".health.timeout", "健康检查超时无效（须大于 0 且不超过 86400s）") end
+    healthTimeout = h.timeout
+  end
+  local healthStatus = 200
+  if h.status ~= nil then
+    local n = integerOf(h.status)
+    if not n or n < 100 or n > 599 then
+      return nil, bad(field .. ".health.status", "健康检查状态码必须是 100-599 的整数")
+    end
+    healthStatus = n
+  end
+
+  local skipVerify = false
+  if p.skipVerify ~= nil then
+    if type(p.skipVerify) ~= "boolean" then return nil, bad(field .. ".skipVerify", "跳过证书校验开关必须是布尔值") end
+    skipVerify = p.skipVerify
+  end
+  if skipVerify and not sawHttps then
+    return nil, bad(field .. ".skipVerify", "跳过证书校验仅适用于 https:// 上游")
+  end
+
+  local hostHeader = ""
+  if p.hostHeader ~= nil then
+    if type(p.hostHeader) ~= "string" then return nil, bad(field .. ".hostHeader", "Host 头必须是字符串") end
+    if #p.hostHeader > 255 then return nil, bad(field .. ".hostHeader", "Host 头不能超过 255 个字符") end
+    if p.hostHeader ~= "" and not p.hostHeader:match(HOST_HEADER_PATTERN) then
+      return nil, bad(field .. ".hostHeader", "Host 头包含非法字符")
+    end
+    hostHeader = p.hostHeader
+  end
+
+  local dialTimeout = "5s"
+  if p.dialTimeout ~= nil then
+    if not validDuration(p.dialTimeout) then return nil, bad(field .. ".dialTimeout", "连接超时无效（须大于 0 且不超过 86400s）") end
+    dialTimeout = p.dialTimeout
+  end
+  local responseHeaderTimeout = "30s"
+  if p.responseHeaderTimeout ~= nil then
+    if not validDuration(p.responseHeaderTimeout) then
+      return nil, bad(field .. ".responseHeaderTimeout", "响应头超时无效（须大于 0 且不超过 86400s）")
+    end
+    responseHeaderTimeout = p.responseHeaderTimeout
+  end
+
+  return {
+    upstreams = upstreams,
+    lbPolicy = lbPolicy,
+    health = {
+      enabled = healthEnabled,
+      uri = healthUri,
+      interval = healthInterval,
+      timeout = healthTimeout,
+      status = healthStatus,
+    },
+    skipVerify = skipVerify,
+    hostHeader = hostHeader,
+    dialTimeout = dialTimeout,
+    responseHeaderTimeout = responseHeaderTimeout,
+  }
+end
+
+-- Routes use literal paths. Escape regex punctuation in generation and reserve
+-- wildcard syntax, percent-escaping, dot segments and placeholders for raw edits.
+local function validRoutePath(path)
+  return type(path) == "string" and #path <= 1024 and path:match("^/[A-Za-z0-9._~/-]*$")
+    and not path:find("//", 1, true) and not (path .. "/"):find("/%.%.?/")
+end
+
+local function normalizeRouting(value)
+  if not isObjectTable(value) then return nil, bad("routing", "路径路由必须是对象") end
+  local ok, count = isListT(value.rules)
+  if not ok or count < 1 or count > 20 then
+    return nil, bad("routing.rules", "请配置 1–20 条路径规则")
+  end
+  local rules, seen = util.array({}), {}
+  for i, rule in ipairs(value.rules) do
+    local field = "routing.rules." .. i
+    if not isObjectTable(rule) then return nil, bad(field, "路径规则必须是对象") end
+    local kind, path = rule.match, rule.path
+    if kind ~= "exact" and kind ~= "prefix" then return nil, bad(field .. ".match", "请选择精确或按段前缀") end
+    if not validRoutePath(path) or (kind == "prefix" and path ~= "/" and path:sub(-1) == "/") then
+      return nil, bad(field .. ".path", "请输入字面路径。按段前缀除 / 外不能以斜杠结尾")
+    end
+    local key = kind .. ":" .. path
+    if seen[key] then return nil, bad(field .. ".path", "路径规则重复：" .. path) end
+    seen[key] = true
+    local action = rule.action or "preserve"
+    if action == "strip" then
+      if kind ~= "prefix" or path == "/" then
+        return nil, bad(field .. ".action", "剥离适用于非根路径的按段前缀")
+      end
+    elseif action == "rewrite" then
+      if not validRoutePath(rule.rewrite) then
+        return nil, bad(field .. ".rewrite", "请输入以 / 开头的固定重写路径")
+      end
+    elseif action ~= "preserve" then
+      return nil, bad(field .. ".action", "路径处理方式无效")
+    end
+    local proxy, err = normalizeProxy(rule.proxy, field .. ".proxy")
+    if not proxy then return nil, err end
+    rules[#rules + 1] = {
+      match = kind, path = path, action = action,
+      rewrite = action == "rewrite" and rule.rewrite or nil, proxy = proxy,
+    }
+  end
+  local source = value.fallback
+  if not isObjectTable(source) then return nil, bad("routing.fallback", "请选择兜底方式") end
+  local fallback, err = { type = source.type }, nil
+  if source.type == "static" then
+    fallback.static, err = normalizeStatic(source.static, "routing.fallback.static", false)
+  elseif source.type == "proxy" then
+    fallback.proxy, err = normalizeProxy(source.proxy, "routing.fallback.proxy")
+  elseif source.type ~= "404" then
+    return nil, bad("routing.fallback.type", "兜底方式必须为静态文件、代理或 404")
+  end
+  if err then return nil, err end
+  return { rules = rules, fallback = fallback }
+end
+
+local function normalizeAccess(value)
+  if not isObjectTable(value) then return nil, bad("access", "访问入口必须是对象") end
+  local protocol, scope = value.protocol, value.scope
+  if protocol ~= "auto" and protocol ~= "internal" and protocol ~= "http" then
+    return nil, bad("access.protocol", "请选择访问协议")
+  end
+  if scope ~= "local" and scope ~= "address" and scope ~= "all" then
+    return nil, bad("access.scope", "请选择监听范围")
+  end
+  local address
+  if scope == "address" then
+    if type(value.bindAddress) == "string" then
+      address = canonicalIP(value.bindAddress:gsub("^%[(.*)%]$", "%1"))
+    end
+    if not address or address == "0.0.0.0" or address == "::" then
+      return nil, bad("access.bindAddress", "请输入本机网卡的具体 IPv4 或 IPv6 地址")
+    end
+  end
+  local port
+  if value.port ~= nil then
+    port = integerOf(value.port)
+    if not port or port < 1 or port > 65535 then return nil, bad("access.port", "端口必须介于 1 和 65535") end
+  end
+  return { protocol = protocol, scope = scope, bindAddress = address, port = port }
+end
+
+function M.accessPort(access)
+  return access.port or (access.protocol == "http" and 80 or 443)
+end
+
+local function explicitAuthority(address, access)
+  local host = validIPv6(address) and ("[" .. address .. "]") or address
+  return host .. ":" .. M.accessPort(access)
+end
+
+function M.accessUrls(model)
+  local urls = util.array({})
+  if type(model) ~= "table" or type(model.domains) ~= "table" then return urls end
+  for _, address in ipairs(model.domains) do
+    if model.access then
+      local scheme = model.access.protocol == "http" and "http" or "https"
+      local authority = explicitAuthority(address, model.access)
+      local port = M.accessPort(model.access)
+      if port == (scheme == "http" and 80 or 443) then authority = authority:gsub(":%d+$", "") end
+      urls[#urls + 1] = scheme .. "://" .. authority
+    elseif not address:match("^0%.0%.0%.0:") then
+      local http = listenerAddress(address) ~= nil or model.https == false
+      urls[#urls + 1] = (http and "http://" or "https://") .. address
+    end
+  end
+  return urls
+end
+
 -- Validate and normalize a site model.
 function M.validate(model, opts)
   opts = opts or {}
@@ -649,6 +975,16 @@ function M.validate(model, opts)
     https = model.https
   end
 
+  local access
+  if model.access ~= nil then
+    local err
+    access, err = normalizeAccess(model.access)
+    if not access then return nil, err end
+    https = access.protocol ~= "http"
+  elseif opts.existing and opts.existing.access then
+    return nil, bad("access.scope", "此站点需要明确的监听范围")
+  end
+
   local group = "默认"
   if model.group ~= nil then
     if type(model.group) ~= "string" then return nil, bad("group", "分组必须是字符串") end
@@ -666,41 +1002,57 @@ function M.validate(model, opts)
   end
 
   local okDomains, domainCount = isListT(model.domains)
-  if not okDomains then return nil, bad("domains", "域名必须是数组") end
-  if domainCount < 1 then return nil, bad("domains", "至少需要一个域名") end
+  if not okDomains then return nil, bad("domains", "站点地址必须是数组") end
+  if domainCount < 1 then return nil, bad("domains", "至少需要一个站点地址") end
   if domainCount > M.MAX_DOMAINS then
-    return nil, bad("domains", "域名数量不能超过 " .. M.MAX_DOMAINS .. " 个")
+    return nil, bad("domains", "站点地址数量不能超过 " .. M.MAX_DOMAINS .. " 个")
   end
   local domains = util.array({})
   local seenDomain = {}
   for i = 1, domainCount do
     local raw = model.domains[i]
-    if type(raw) ~= "string" then return nil, bad("domains", "域名必须是字符串") end
+    if type(raw) ~= "string" then return nil, bad("domains", "站点地址必须是字符串") end
     local d = util.lower(raw)
-    if #d > 253 then return nil, bad("domains", "域名长度不能超过 253 个字符") end
+    if #d > 253 then return nil, bad("domains", "站点地址长度不能超过 253 个字符") end
     if util.trim(d) ~= d or d:find("%s") then
-      return nil, bad("domains", "域名不能包含空白字符")
+      return nil, bad("domains", "站点地址不能包含空白字符")
     end
-    if d:match(IPV4_PATTERN) then
-      return nil, bad("domains", "不支持使用 IP 地址作为域名：" .. d)
-    end
-    if not validDomain(d) then
-      return nil, bad("domains", "域名格式无效：" .. d)
+    local port = listenerAddress(d)
+    if access then
+      local unbracketed = d:gsub("^%[(.*)%]$", "%1")
+      local ip = canonicalIP(unbracketed)
+      if d ~= unbracketed and (not ip or not ip:find(":", 1, true)) then
+        return nil, bad("domains", "方括号仅用于 IPv6 地址：" .. d)
+      end
+      d = ip or d
+      if d == "0.0.0.0" or d == "::" or (d:match(IPV4_PATTERN) and not ip)
+        or (not ip and not validDomain(d)) then
+        return nil, bad("domains", "请输入证书或 HTTP Host 使用的域名或 IP，端口单独填写：" .. d)
+      end
+      if access.protocol == "auto" and ip then
+        return nil, bad("domains", "IP 地址请选择内网 HTTPS 或仅 HTTP：" .. d)
+      end
+    elseif port then
+      local number = tonumber(port)
+      if number < 1 or number > 65535 then
+        return nil, bad("domains", "监听端口必须介于 1 和 65535：" .. d)
+      end
+      d = d:gsub(":%d+$", ":" .. number)
+    elseif d:match(IPV4_PATTERN) or not validDomain(d) then
+      return nil, bad("domains", "站点地址格式无效：" .. d)
     end
     if not seenDomain[d] then
       seenDomain[d] = true
       domains[#domains + 1] = d
     end
   end
-  if #domains < 1 then return nil, bad("domains", "至少需要一个有效域名") end
-
   if opts.sites and type(opts.sites.domains) == "table" then
     for i = 1, #domains do
       local owner = opts.sites.domains[domains[i]]
       if type(owner) == "string" and (not opts.slug or owner ~= opts.slug) then
         return nil, {
           code = "conflict",
-          message = "域名 " .. domains[i] .. " 已被站点 " .. owner .. " 使用",
+          message = "站点地址 " .. domains[i] .. " 已被站点 " .. owner .. " 使用",
           details = { field = "domains", domain = domains[i], slug = owner },
           status = 409,
         }
@@ -708,172 +1060,22 @@ function M.validate(model, opts)
     end
   end
 
-  local static = nil
+  local static, proxy, routing, err
   if typ == "static" then
-    local st = model.static
-    if st == nil then st = {} end
-    if type(st) ~= "table" or not isObjectTable(st) then
-      return nil, bad("static", "静态站配置必须是对象")
-    end
-    local root = ""
-    if st.root ~= nil then
-      if type(st.root) ~= "string" then return nil, bad("static.root", "根目录必须是字符串") end
-      root = st.root
-    end
-    local browse = false
-    if st.browse ~= nil then
-      if type(st.browse) ~= "boolean" then return nil, bad("static.browse", "目录浏览开关必须是布尔值") end
-      browse = st.browse
-    end
-    local spa = false
-    if st.spa ~= nil then
-      if type(st.spa) ~= "boolean" then return nil, bad("static.spa", "SPA 开关必须是布尔值") end
-      spa = st.spa
-    end
-    if util.trim(root) == "" then
-      if not opts.creating then return nil, bad("static.root", "根目录不能为空") end
-      root = ""
-    else
-      if #root > 4096 then return nil, bad("static.root", "根目录不能超过 4096 个字符") end
-      if not util.isAbsolute(root) then return nil, bad("static.root", "根目录必须是绝对路径") end
-      if hasCrLfNul(root) then return nil, bad("static.root", "根目录不能包含换行或 NUL 字符") end
-    end
-    static = { root = root, browse = browse, spa = spa }
+    static, err = normalizeStatic(model.static, "static", opts.creating)
+    if not static then return nil, err end
+  elseif typ == "proxy" and model.routing == nil then
+    proxy, err = normalizeProxy(model.proxy, "proxy")
+    if not proxy then return nil, err end
   end
-
-  local proxy = nil
-  if typ == "proxy" then
-    local p = model.proxy
-    if type(p) ~= "table" or not isObjectTable(p) then
-      return nil, bad("proxy", "反向代理配置必须是对象")
+  if model.routing ~= nil then
+    if typ ~= "proxy" then return nil, bad("routing", "路径路由适用于反向代理站点") end
+    routing, err = normalizeRouting(model.routing)
+    if not routing then return nil, err end
+    if model.proxy ~= nil then
+      proxy, err = normalizeProxy(model.proxy, "proxy")
+      if not proxy then return nil, err end
     end
-
-    local okUps, upCount = isListT(p.upstreams)
-    if not okUps then return nil, bad("proxy.upstreams", "上游必须是数组") end
-    if upCount < 1 then return nil, bad("proxy.upstreams", "至少需要一个上游") end
-    if upCount > M.MAX_UPSTREAMS then
-      return nil, bad("proxy.upstreams", "上游数量不能超过 " .. M.MAX_UPSTREAMS .. " 个")
-    end
-    local upstreams = util.array({})
-    local sawBare, sawHttp, sawHttps = false, false, false
-    for i = 1, upCount do
-      local raw = p.upstreams[i]
-      if type(raw) ~= "string" then return nil, bad("proxy.upstreams", "上游必须是字符串") end
-      local u = util.trim(raw)
-      if not validUpstream(u) then
-        return nil, bad("proxy.upstreams", "上游格式无效（仅支持 host:port、[v6]:port 或 http(s)://host:port）：" .. raw)
-      end
-      if u:sub(1, 8) == "https://" then
-        sawHttps = true
-      elseif u:sub(1, 7) == "http://" then
-        sawHttp = true
-      else
-        sawBare = true
-      end
-      upstreams[#upstreams + 1] = u
-    end
-    -- Caddy's reverse_proxy accepts either all scheme-less upstreams or one
-    -- explicit scheme for all of them. Mixing forms is order-sensitive and can
-    -- change TLS behavior, so reject it instead of guessing.
-    if (sawBare and (sawHttp or sawHttps)) or (sawHttp and sawHttps) then
-      return nil, bad("proxy.upstreams",
-        "同一反向代理的上游必须全部不带 scheme，或全部使用相同的 http:// / https://")
-    end
-
-    local lbPolicy = "round_robin"
-    if p.lbPolicy ~= nil then
-      if type(p.lbPolicy) ~= "string" or not LB_SET[p.lbPolicy] then
-        return nil, bad("proxy.lbPolicy", "负载均衡策略无效")
-      end
-      lbPolicy = p.lbPolicy
-    end
-
-    local h = p.health
-    if h == nil then h = {} end
-    if type(h) ~= "table" or not isObjectTable(h) then
-      return nil, bad("proxy.health", "健康检查配置必须是对象")
-    end
-    local healthEnabled = false
-    if h.enabled ~= nil then
-      if type(h.enabled) ~= "boolean" then return nil, bad("proxy.health.enabled", "健康检查开关必须是布尔值") end
-      healthEnabled = h.enabled
-    end
-    local healthUri = "/health"
-    if h.uri ~= nil then
-      if type(h.uri) ~= "string" then return nil, bad("proxy.health.uri", "健康检查路径必须是字符串") end
-      healthUri = h.uri
-    end
-    if #healthUri > 1024 then return nil, bad("proxy.health.uri", "健康检查路径不能超过 1024 个字符") end
-    if healthUri:sub(1, 1) ~= "/" or healthUri:find("%s") or hasControl(healthUri)
-      or healthUri:find("{", 1, true) or healthUri:find("}", 1, true) then
-      return nil, bad("proxy.health.uri", "健康检查路径必须以 / 开头且不能包含空白或花括号")
-    end
-    local healthInterval = "10s"
-    if h.interval ~= nil then
-      if not validDuration(h.interval) then return nil, bad("proxy.health.interval", "健康检查间隔无效（须大于 0 且不超过 86400s）") end
-      healthInterval = h.interval
-    end
-    local healthTimeout = "3s"
-    if h.timeout ~= nil then
-      if not validDuration(h.timeout) then return nil, bad("proxy.health.timeout", "健康检查超时无效（须大于 0 且不超过 86400s）") end
-      healthTimeout = h.timeout
-    end
-    local healthStatus = 200
-    if h.status ~= nil then
-      local n = integerOf(h.status)
-      if not n or n < 100 or n > 599 then
-        return nil, bad("proxy.health.status", "健康检查状态码必须是 100-599 的整数")
-      end
-      healthStatus = n
-    end
-
-    local skipVerify = false
-    if p.skipVerify ~= nil then
-      if type(p.skipVerify) ~= "boolean" then return nil, bad("proxy.skipVerify", "跳过证书校验开关必须是布尔值") end
-      skipVerify = p.skipVerify
-    end
-    if skipVerify and not sawHttps then
-      return nil, bad("proxy.skipVerify", "跳过证书校验仅适用于 https:// 上游")
-    end
-
-    local hostHeader = ""
-    if p.hostHeader ~= nil then
-      if type(p.hostHeader) ~= "string" then return nil, bad("proxy.hostHeader", "Host 头必须是字符串") end
-      if #p.hostHeader > 255 then return nil, bad("proxy.hostHeader", "Host 头不能超过 255 个字符") end
-      if p.hostHeader ~= "" and not p.hostHeader:match(HOST_HEADER_PATTERN) then
-        return nil, bad("proxy.hostHeader", "Host 头包含非法字符")
-      end
-      hostHeader = p.hostHeader
-    end
-
-    local dialTimeout = "5s"
-    if p.dialTimeout ~= nil then
-      if not validDuration(p.dialTimeout) then return nil, bad("proxy.dialTimeout", "连接超时无效（须大于 0 且不超过 86400s）") end
-      dialTimeout = p.dialTimeout
-    end
-    local responseHeaderTimeout = "30s"
-    if p.responseHeaderTimeout ~= nil then
-      if not validDuration(p.responseHeaderTimeout) then
-        return nil, bad("proxy.responseHeaderTimeout", "响应头超时无效（须大于 0 且不超过 86400s）")
-      end
-      responseHeaderTimeout = p.responseHeaderTimeout
-    end
-
-    proxy = {
-      upstreams = upstreams,
-      lbPolicy = lbPolicy,
-      health = {
-        enabled = healthEnabled,
-        uri = healthUri,
-        interval = healthInterval,
-        timeout = healthTimeout,
-        status = healthStatus,
-      },
-      skipVerify = skipVerify,
-      hostHeader = hostHeader,
-      dialTimeout = dialTimeout,
-      responseHeaderTimeout = responseHeaderTimeout,
-    }
   end
 
   local redirect = nil
@@ -925,6 +1127,8 @@ function M.validate(model, opts)
     note = note,
     security = security,
   }
+  if access then out.access = access end
+  if routing then out.routing = routing end
   if static then out.static = static end
   if proxy then out.proxy = proxy end
   if redirect then out.redirect = redirect end
@@ -935,8 +1139,17 @@ local function genError(message, field)
   return nil, { code = "invalid_model", message = message, details = { field = field or "model" }, status = 400 }
 end
 
-local function appendSecurity(lines, security)
+local function appendIpFilter(lines, security)
+  local ips = security.ipList
+  if type(ips) ~= "table" or not security.ipMode or security.ipMode == "off" or #ips == 0 then return end
+  local matcher = security.ipMode == "allow" and "not remote_ip " or "remote_ip "
+  lines[#lines + 1] = "\t@denied " .. matcher .. table.concat(ips, " ")
+  lines[#lines + 1] = "\trespond @denied 403"
+end
+
+local function appendSecurity(lines, security, ordered)
   if type(security) ~= "table" then return end
+  if ordered then appendIpFilter(lines, security) end
   local auth = security.basicAuth
   if type(auth) == "table" and #auth > 0 then
     lines[#lines + 1] = "\tbasic_auth {"
@@ -946,16 +1159,7 @@ local function appendSecurity(lines, security)
     lines[#lines + 1] = "\t}"
   end
 
-  local ips = security.ipList
-  if type(ips) == "table" and security.ipMode and security.ipMode ~= "off" and #ips > 0 then
-    local joined = table.concat(ips, " ")
-    if security.ipMode == "allow" then
-      lines[#lines + 1] = "\t@denied not remote_ip " .. joined
-    else
-      lines[#lines + 1] = "\t@denied remote_ip " .. joined
-    end
-    lines[#lines + 1] = "\trespond @denied 403"
-  end
+  if not ordered then appendIpFilter(lines, security) end
 
   local headers = security.headers
   local headerCount = 0
@@ -981,19 +1185,151 @@ local function appendSecurity(lines, security)
   end
 end
 
+local function appendStatic(lines, st)
+  local root = st.root
+  if type(root) ~= "string" or root == "" then return genError("根目录不能为空", "static.root") end
+  if hasCrLfNul(root) then return genError("根目录包含非法字符", "static.root") end
+  lines[#lines + 1] = "\troot * " .. quoteAlways(root)
+  if st.spa then lines[#lines + 1] = "\ttry_files {path} /index.html" end
+  if st.browse then
+    lines[#lines + 1] = "\tfile_server browse"
+  else
+    lines[#lines + 1] = "\tfile_server"
+  end
+  return true
+end
+
+local function appendProxy(lines, p)
+  local upstreams = p.upstreams
+  if type(upstreams) ~= "table" or #upstreams < 1 then return genError("上游不能为空", "proxy.upstreams") end
+  for i = 1, #upstreams do
+    if type(upstreams[i]) ~= "string" or not validUpstream(upstreams[i]) then
+      return genError("上游格式无效", "proxy.upstreams")
+    end
+  end
+  lines[#lines + 1] = "\treverse_proxy " .. table.concat(upstreams, " ") .. " {"
+  lines[#lines + 1] = "\t\tlb_policy " .. (p.lbPolicy or "round_robin")
+  local health = p.health
+  if type(health) == "table" and health.enabled then
+    lines[#lines + 1] = "\t\thealth_uri " .. tostring(health.uri or "/health")
+    lines[#lines + 1] = "\t\thealth_interval " .. tostring(health.interval or "10s")
+    lines[#lines + 1] = "\t\thealth_timeout " .. tostring(health.timeout or "3s")
+    lines[#lines + 1] = "\t\thealth_status " .. tostring(health.status or 200)
+  end
+  if type(p.hostHeader) == "string" and p.hostHeader ~= "" then
+    if hasCrLfNul(p.hostHeader) then return genError("Host 头包含非法字符", "proxy.hostHeader") end
+    lines[#lines + 1] = "\t\theader_up Host " .. quoteToken(p.hostHeader)
+  end
+
+  local hasHttps = false
+  for i = 1, #upstreams do
+    if upstreams[i]:sub(1, 8) == "https://" then
+      hasHttps = true
+      break
+    end
+  end
+  local skipVerify = p.skipVerify == true
+  local dialTimeout = p.dialTimeout or "5s"
+  local responseHeaderTimeout = p.responseHeaderTimeout or "30s"
+  local needTls = hasHttps and skipVerify
+  local needTransport = needTls or dialTimeout ~= "5s" or responseHeaderTimeout ~= "30s"
+  if needTransport then
+    lines[#lines + 1] = "\t\ttransport http {"
+    if needTls then lines[#lines + 1] = "\t\t\ttls_insecure_skip_verify" end
+    lines[#lines + 1] = "\t\t\tdial_timeout " .. dialTimeout
+    lines[#lines + 1] = "\t\t\tresponse_header_timeout " .. responseHeaderTimeout
+    lines[#lines + 1] = "\t\t}"
+  end
+  lines[#lines + 1] = "\t}"
+  return true
+end
+
+local function indented(lines, nested)
+  for _, line in ipairs(nested) do lines[#lines + 1] = "\t" .. line end
+end
+
+local function appendRouting(lines, routing, security)
+  local rules = routing.rules
+  table.sort(rules, function(a, b)
+    if a.match ~= b.match then return a.match == "exact" end
+    if #a.path ~= #b.path then return #a.path > #b.path end
+    return a.path < b.path
+  end)
+
+  for i, rule in ipairs(rules) do
+    local literal = rule.path:gsub("%.", "[.]")
+    local suffix = "$"
+    if rule.match == "prefix" then suffix = rule.path == "/" and "" or "(/|$)" end
+    lines[#lines + 1] = "\t@ecm_path_" .. i .. " path_regexp ^" .. literal .. suffix
+  end
+  -- Handlers inside route retain their declared order. The handle group
+  -- selects one branch even if its upstream returns 404.
+  lines[#lines + 1] = "\troute {"
+  local ordered = {}
+  appendSecurity(ordered, security, true)
+  for i, rule in ipairs(rules) do
+    ordered[#ordered + 1] = "\thandle @ecm_path_" .. i .. " {"
+    local branch = {}
+    if rule.action == "strip" then
+      branch[#branch + 1] = "\turi strip_prefix " .. rule.path
+    elseif rule.action == "rewrite" then
+      branch[#branch + 1] = "\trewrite " .. rule.rewrite
+    end
+    local ok, err = appendProxy(branch, rule.proxy)
+    if not ok then return nil, err end
+    indented(ordered, branch)
+    ordered[#ordered + 1] = "\t}"
+  end
+  local branch, fallback = {}, routing.fallback
+  local ok, err = true, nil
+  if fallback.type == "proxy" then
+    ok, err = appendProxy(branch, fallback.proxy)
+  elseif fallback.type == "static" then
+    ok, err = appendStatic(branch, fallback.static)
+  else
+    branch[#branch + 1] = "\trespond 404"
+  end
+  if not ok then return nil, err end
+  ordered[#ordered + 1] = "\thandle {"
+  indented(ordered, branch)
+  ordered[#ordered + 1] = "\t}"
+  indented(lines, ordered)
+  lines[#lines + 1] = "\t}"
+  return true
+end
+
 -- Render the snippet for a validated site model.
 function M.generate(model)
   if type(model) ~= "table" then return genError("站点模型无效") end
   local typ = model.type
   local domains = model.domains
-  if type(domains) ~= "table" or #domains < 1 then return genError("域名不能为空", "domains") end
+  if type(domains) ~= "table" or #domains < 1 then return genError("站点地址不能为空", "domains") end
 
-  local addresses = util.array({})
+  local addresses = {}
+  local localAddresses = {}
+  local wildcardPorts = {}
   local useHttps = model.https ~= false
+  local access
+  if model.access then
+    local err
+    access, err = normalizeAccess(model.access)
+    if not access then return nil, err end
+  end
   for i = 1, #domains do
     local d = domains[i]
-    if type(d) ~= "string" or d == "" then return genError("域名无效", "domains") end
-    if useHttps then
+    if type(d) ~= "string" or d == "" then return genError("站点地址无效", "domains") end
+    local port, bind = listenerAddress(d)
+    if access then
+      if not (validDomain(d) or validIPv4(d) or validIPv6(d)) then
+        return genError("站点地址无效", "domains")
+      end
+      local scheme = access.protocol == "http" and "http" or "https"
+      addresses[#addresses + 1] = scheme .. "://" .. explicitAuthority(d, access)
+    elseif bind == "0.0.0.0" then
+      wildcardPorts[#wildcardPorts + 1] = port
+    elseif bind == "127.0.0.1" then
+      localAddresses[#localAddresses + 1] = "http://" .. d
+    elseif useHttps then
       addresses[#addresses + 1] = d
     else
       addresses[#addresses + 1] = "http://" .. d
@@ -1001,74 +1337,28 @@ function M.generate(model)
   end
 
   local lines = {}
-  lines[#lines + 1] = HEADER_COMMENT
-  lines[#lines + 1] = table.concat(addresses, ", ") .. " {"
-
   local security = model.security or defaultSecurity()
+  if typ ~= "redirect" and security.encode then lines[#lines + 1] = "\tencode zstd gzip" end
+  local logLine = #lines + 1
+  lines[logLine] = "\tlog"
 
   if typ == "static" then
-    if security.encode then lines[#lines + 1] = "\tencode zstd gzip" end
-    lines[#lines + 1] = "\tlog"
-    local st = model.static or {}
-    local root = st.root
-    if type(root) ~= "string" or root == "" then return genError("根目录不能为空", "static.root") end
-    if hasCrLfNul(root) then return genError("根目录包含非法字符", "static.root") end
-    lines[#lines + 1] = "\troot * " .. quoteAlways(root)
-    if st.spa then lines[#lines + 1] = "\ttry_files {path} /index.html" end
-    if st.browse then
-      lines[#lines + 1] = "\tfile_server browse"
-    else
-      lines[#lines + 1] = "\tfile_server"
-    end
+    local ok, err = appendStatic(lines, model.static or {})
+    if not ok then return nil, err end
     appendSecurity(lines, security)
   elseif typ == "proxy" then
-    if security.encode then lines[#lines + 1] = "\tencode zstd gzip" end
-    lines[#lines + 1] = "\tlog"
-    local p = model.proxy or {}
-    local upstreams = p.upstreams
-    if type(upstreams) ~= "table" or #upstreams < 1 then return genError("上游不能为空", "proxy.upstreams") end
-    for i = 1, #upstreams do
-      if type(upstreams[i]) ~= "string" or not validUpstream(upstreams[i]) then
-        return genError("上游格式无效", "proxy.upstreams")
-      end
+    if model.routing then
+      local routing, err = normalizeRouting(model.routing)
+      if not routing then return nil, err end
+      local ok
+      ok, err = appendRouting(lines, routing, security)
+      if not ok then return nil, err end
+    else
+      local ok, err = appendProxy(lines, model.proxy or {})
+      if not ok then return nil, err end
+      appendSecurity(lines, security)
     end
-    lines[#lines + 1] = "\treverse_proxy " .. table.concat(upstreams, " ") .. " {"
-    lines[#lines + 1] = "\t\tlb_policy " .. (p.lbPolicy or "round_robin")
-    local health = p.health
-    if type(health) == "table" and health.enabled then
-      lines[#lines + 1] = "\t\thealth_uri " .. tostring(health.uri or "/health")
-      lines[#lines + 1] = "\t\thealth_interval " .. tostring(health.interval or "10s")
-      lines[#lines + 1] = "\t\thealth_timeout " .. tostring(health.timeout or "3s")
-      lines[#lines + 1] = "\t\thealth_status " .. tostring(health.status or 200)
-    end
-    if type(p.hostHeader) == "string" and p.hostHeader ~= "" then
-      if hasCrLfNul(p.hostHeader) then return genError("Host 头包含非法字符", "proxy.hostHeader") end
-      lines[#lines + 1] = "\t\theader_up Host " .. quoteToken(p.hostHeader)
-    end
-
-    local hasHttps = false
-    for i = 1, #upstreams do
-      if upstreams[i]:sub(1, 8) == "https://" then
-        hasHttps = true
-        break
-      end
-    end
-    local skipVerify = p.skipVerify == true
-    local dialTimeout = p.dialTimeout or "5s"
-    local responseHeaderTimeout = p.responseHeaderTimeout or "30s"
-    local needTls = hasHttps and skipVerify
-    local needTransport = needTls or dialTimeout ~= "5s" or responseHeaderTimeout ~= "30s"
-    if needTransport then
-      lines[#lines + 1] = "\t\ttransport http {"
-      if needTls then lines[#lines + 1] = "\t\t\ttls_insecure_skip_verify" end
-      lines[#lines + 1] = "\t\t\tdial_timeout " .. dialTimeout
-      lines[#lines + 1] = "\t\t\tresponse_header_timeout " .. responseHeaderTimeout
-      lines[#lines + 1] = "\t\t}"
-    end
-    lines[#lines + 1] = "\t}"
-    appendSecurity(lines, security)
   elseif typ == "redirect" then
-    lines[#lines + 1] = "\tlog"
     local r = model.redirect or {}
     local target = r.target
     if type(target) ~= "string" or target == "" then return genError("重定向目标不能为空", "redirect.target") end
@@ -1080,8 +1370,25 @@ function M.generate(model)
     return genError("站点类型无效", "type")
   end
 
-  lines[#lines + 1] = "}"
-  local text = table.concat(lines, "\n") .. "\n"
+  local body = table.concat(lines, "\n")
+  local blocks = { HEADER_COMMENT .. "\n" }
+  if access then
+    local bind = access.scope == "local" and "127.0.0.1 ::1" or access.bindAddress or '""'
+    local entry = "\tbind " .. bind .. "\n"
+    if access.protocol == "internal" then entry = entry .. "\ttls internal\n" end
+    blocks[#blocks + 1] = table.concat(addresses, ", ") .. " {\n" .. entry .. body .. "\n}\n"
+  elseif #addresses > 0 then
+    blocks[#blocks + 1] = table.concat(addresses, ", ") .. " {\n" .. body .. "\n}\n"
+  end
+  if #localAddresses > 0 then
+    blocks[#blocks + 1] = table.concat(localAddresses, ", ") .. " {\n\tbind 127.0.0.1\n" .. body .. "\n}\n"
+  end
+  for _, port in ipairs(wildcardPorts) do
+    -- The listener accepts any Host, so record which port served the request.
+    lines[logLine] = "\tlog ecm-ipv4-" .. port
+    blocks[#blocks + 1] = "http://:" .. port .. " {\n\tbind 0.0.0.0\n" .. table.concat(lines, "\n") .. "\n}\n"
+  end
+  local text = table.concat(blocks)
   if #text > M.MAX_SNIPPET then
     return nil, sizeErr("content", "生成的片段超过 48 KiB 限制", { limit = M.MAX_SNIPPET, size = #text })
   end
@@ -1098,6 +1405,18 @@ function M.slugFor(model, takenFn)
   return util.slugify(name, domains, takenFn)
 end
 
+function M.modelCertDomains(model)
+  local out = util.array({})
+  if type(model) == "table" and model.access == nil and model.https == true and type(model.domains) == "table" then
+    for _, address in ipairs(model.domains) do
+      if type(address) == "string" and address ~= "" and not listenerAddress(address) then
+        out[#out + 1] = util.lower(address)
+      end
+    end
+  end
+  return out
+end
+
 -- Unique domains across enabled managed sites with automatic HTTPS.
 function M.certDomains(items)
   local seen = {}
@@ -1105,17 +1424,10 @@ function M.certDomains(items)
   if type(items) ~= "table" then return out end
   for _, item in ipairs(items) do
     if type(item) == "table" and not item.custom and not item.orphan and item.enabled then
-      local model = item.model
-      if type(model) == "table" and model.https == true and type(model.domains) == "table" then
-        for i = 1, #model.domains do
-          local d = model.domains[i]
-          if type(d) == "string" and d ~= "" then
-            local ld = util.lower(d)
-            if not seen[ld] then
-              seen[ld] = true
-              out[#out + 1] = ld
-            end
-          end
+      for _, domain in ipairs(M.modelCertDomains(item.model)) do
+        if not seen[domain] then
+          seen[domain] = true
+          out[#out + 1] = domain
         end
       end
     end

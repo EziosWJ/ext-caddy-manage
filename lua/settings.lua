@@ -15,6 +15,7 @@ M.DEFAULTS = {
   logLines = 500,
   certProbeHours = 6,
   backupKeep = 100,
+  metricsPeriodic = false,
 }
 
 local LABELS = {
@@ -27,6 +28,7 @@ local LABELS = {
   logLines = "日志轮询行数",
   certProbeHours = "证书探测间隔（小时）",
   backupKeep = "备份保留数",
+  metricsPeriodic = "每 60 秒采集运行快照",
 }
 
 local ORDER = {
@@ -38,6 +40,7 @@ local ORDER = {
   "logLines",
   "certProbeHours",
   "backupKeep",
+  "metricsPeriodic",
 }
 
 -- systemd unit names may contain ':', '_', '.', '@', '-'.
@@ -59,6 +62,7 @@ local function makeEffective(values, warnings)
     logLines = values.logLines,
     certProbeHours = values.certProbeHours,
     backupKeep = values.backupKeep,
+    metricsPeriodic = values.metricsPeriodic,
   }
   return {
     caddyBinary = values.caddyBinary,
@@ -70,6 +74,7 @@ local function makeEffective(values, warnings)
     logLines = values.logLines,
     certProbeHours = values.certProbeHours,
     backupKeep = values.backupKeep,
+    metricsPeriodic = values.metricsPeriodic,
     dataDir = dataDir,
     backupsDir = dataDir .. "/backups",
     warnings = warnings,
@@ -163,6 +168,7 @@ local function build()
     logLines = logLines,
     certProbeHours = certProbeHours,
     backupKeep = backupKeep,
+    metricsPeriodic = all.metricsPeriodic == true,
   }, warnings)
 end
 
@@ -180,6 +186,7 @@ function M.load()
     logLines = M.DEFAULTS.logLines,
     certProbeHours = M.DEFAULTS.certProbeHours,
     backupKeep = M.DEFAULTS.backupKeep,
+    metricsPeriodic = M.DEFAULTS.metricsPeriodic,
   }
   return makeEffective(defaults, warnings)
 end

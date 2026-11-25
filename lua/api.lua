@@ -12,6 +12,9 @@ local services = require("services")
 local logs = require("logs")
 local certs = require("certs")
 local apply = require("apply")
+local discovery = require("discovery")
+local metrics = require("metrics")
+local sitecheck = require("sitecheck")
 
 local M = {}
 
@@ -56,7 +59,6 @@ local RECENT_ERROR_CODES = {
   reload_failed = true,
   rollback_failed = true,
   caddy_missing = true,
-  grant_missing = true,
   privilege_missing = true,
   service_error = true,
   journal_unavailable = true,
@@ -193,9 +195,8 @@ end
 
 local function siteCert(item, now)
   if item.custom or item.orphan then return nil end
-  if type(item.model) ~= "table" or item.model.https ~= true then return nil end
-  local domains = item.domains
-  if type(domains) ~= "table" or #domains == 0 then return nil end
+  local domains = sites.modelCertDomains(item.model)
+  if #domains == 0 then return nil end
   local pok, list = pcall(certs.forDomains, domains, now)
   if not pok or type(list) ~= "table" then return nil end
   local best, bestDays = nil, nil
@@ -231,6 +232,7 @@ local function siteSummary(item, now)
     note = item.note or "",
     type = item.type or "custom",
     domains = util.array(domains),
+    urls = sites.accessUrls(item.model),
     enabled = item.enabled and true or false,
     custom = item.custom and true or false,
     orphan = item.orphan and true or false,
@@ -265,8 +267,9 @@ local function siteDetailData(slug)
   local domains = item.domains
   if type(domains) ~= "table" then domains = {} end
   local certList = util.array({})
-  if type(item.model) == "table" and item.model.https == true then
-    local cok, list = pcall(certs.forDomains, domains, now)
+  local certDomains = sites.modelCertDomains(item.model)
+  if #certDomains > 0 then
+    local cok, list = pcall(certs.forDomains, certDomains, now)
     if cok and type(list) == "table" then certList = util.array(list) end
   end
   local data = {
@@ -276,6 +279,7 @@ local function siteDetailData(slug)
     note = item.note or "",
     type = item.type,
     domains = util.array(domains),
+    urls = sites.accessUrls(item.model),
     enabled = item.enabled and true or false,
     custom = item.custom and true or false,
     orphan = item.orphan and true or false,
@@ -294,6 +298,10 @@ local function siteDetailData(slug)
     logLines = settings.load().logLines,
   }
   if item.modelError then data.modelError = true end
+  if item.model and type(item.raw) == "string" then
+    local ok, generated = pcall(sites.generate, item.model)
+    if ok and generated then data.formMatchesFile = generated == item.raw end
+  end
   return data
 end
 
@@ -531,6 +539,18 @@ local function h_site(request)
   return http.ok(data)
 end
 
+local function h_localListeners()
+  return http.ok(discovery.list(settings.load()))
+end
+
+local function h_probeListener(request)
+  local body, err = readBody(request)
+  if not body then return err end
+  local candidate, message = discovery.find(settings.load(), body.candidateId)
+  if not candidate then return http.fail("conflict", message, { field = "candidateId" }) end
+  return http.ok(discovery.probe(candidate))
+end
+
 local function h_siteCreate(request)
   local body, berr = readBody(request)
   if not body then return berr end
@@ -560,6 +580,23 @@ local function h_siteCreate(request)
   end
   local normalized, verr = sites.validate(model, { slug = slug, creating = true, sites = data })
   if not normalized then return failFrom(verr) end
+  local publish = body.publish
+  if publish ~= nil then
+    if not isPlainObject(publish) or not normalized.access then
+      return http.fail("bad_request", "快速发布需要明确配置访问入口", { field = "access.scope" })
+    end
+    if normalized.access.scope == "all" and publish.confirmAll ~= true then
+      return http.fail("bad_request", "请确认所有接口的暴露范围", { field = "confirmAll" })
+    end
+    local candidate
+    if publish.candidateId ~= nil then
+      local message
+      candidate, message = discovery.find(s, publish.candidateId)
+      if not candidate then return http.fail("conflict", message, { field = "candidateId" }) end
+    end
+    local field, message = discovery.checkPublish(s, normalized, candidate)
+    if field then return http.fail("invalid_model", message, { field = field }) end
+  end
   local content, gerr = sites.generate(normalized)
   if type(content) ~= "string" or content == "" then
     if gerr then return failFrom(gerr) end
@@ -572,12 +609,24 @@ local function h_siteCreate(request)
     allowCreate = true,
     reason = "create",
   })
-  if not res then return failFrom(aerr) end
+  if not res then
+    if publish and aerr then
+      aerr.details = aerr.details or {}
+      local rollback = aerr.details.rollback
+      aerr.details.publication = {
+        saved = rollback and not rollback.restored and "unknown" or "no",
+        loaded = "no",
+      }
+    end
+    return failFrom(aerr)
+  end
 
   local modelJson = util.jsonEncode(normalized)
   if type(modelJson) ~= "string" then
-    pcall(apply.deleteSiteFile, slug, nil)
-    return http.fail("internal", "站点模型序列化失败", { slug = slug })
+    local ok, cleanup = pcall(apply.deleteSiteFile, slug, nil)
+    return http.fail("internal", "站点模型序列化失败", {
+      slug = slug, publication = { saved = ok and cleanup and "no" or "unknown", loaded = "unknown" },
+    })
   end
   local now = util.nowUTC()
   local row = {
@@ -594,35 +643,37 @@ local function h_siteCreate(request)
   }
   local dbOk, dbErr = dbCall(store.saveSite, row)
   if not dbOk then
-    pcall(apply.deleteSiteFile, slug, nil)
-    return http.fail("internal", "站点已写入但元数据保存失败：" .. tostring(dbErr), { slug = slug })
+    local ok, cleanup = pcall(apply.deleteSiteFile, slug, nil)
+    return http.fail("internal", "站点已写入但元数据保存失败：" .. tostring(dbErr), {
+      slug = slug, publication = { saved = ok and cleanup and "no" or "unknown", loaded = "unknown" },
+    })
   end
   local detail = siteDetailData(slug)
   if not detail then
-    return http.fail("internal", "站点已创建但读取详情失败", { slug = slug })
+    return http.fail("internal", "站点已创建但读取详情失败", {
+      slug = slug, publication = { saved = "yes", loaded = res.apply.reloaded and "yes" or "no" },
+    })
   end
   detail.apply = res.apply
   return http.ok(detail)
 end
 
-local function h_siteUpdate(request)
-  local body, berr = readBody(request)
-  if not body then return berr end
+local function prepareSiteUpdate(body)
   local slug = http.str(body, "slug")
   if type(slug) ~= "string" or util.trim(slug) == "" then
-    return http.fail("bad_request", "缺少 slug 参数", { field = "slug" })
+    return nil, http.fail("bad_request", "缺少 slug 参数", { field = "slug" })
   end
   local model = body.model
   if type(model) ~= "table" then
-    return http.fail("bad_request", "缺少站点模型 model", { field = "model" })
+    return nil, http.fail("bad_request", "缺少站点模型 model", { field = "model" })
   end
   local item, ierr = siteOrFail(slug)
-  if not item then return ierr end
+  if not item then return nil, ierr end
   if item.custom then
-    return http.fail("bad_request", "自定义片段只能编辑原文", { slug = slug })
+    return nil, http.fail("bad_request", "自定义片段只能编辑原文", { slug = slug })
   end
   if item.orphan then
-    return http.fail("not_found", "站点片段不存在，可能已被外部删除", { slug = slug })
+    return nil, http.fail("not_found", "站点片段不存在，可能已被外部删除", { slug = slug })
   end
   local data = sites.loadAll()
   local normalized, verr = sites.validate(model, {
@@ -631,12 +682,29 @@ local function h_siteUpdate(request)
     existing = item.model or { type = item.type },
     sites = data,
   })
-  if not normalized then return failFrom(verr) end
+  if not normalized then return nil, failFrom(verr) end
   local content, gerr = sites.generate(normalized)
   if type(content) ~= "string" or content == "" then
-    if gerr then return failFrom(gerr) end
-    return http.fail("internal", "生成站点片段失败", { slug = slug })
+    if gerr then return nil, failFrom(gerr) end
+    return nil, http.fail("internal", "生成站点片段失败", { slug = slug })
   end
+  return { slug = slug, item = item, model = normalized, content = content }
+end
+
+local function h_sitePreview(request)
+  local body, berr = readBody(request)
+  if not body then return berr end
+  local prepared, perr = prepareSiteUpdate(body)
+  if not prepared then return perr end
+  return http.ok({ content = prepared.content })
+end
+
+local function h_siteUpdate(request)
+  local body, berr = readBody(request)
+  if not body then return berr end
+  local prepared, perr = prepareSiteUpdate(body)
+  if not prepared then return perr end
+  local slug, item, normalized, content = prepared.slug, prepared.item, prepared.model, prepared.content
   local baseline, baselineErr = optionalStringField(body, "baseline")
   if baselineErr then return baselineErr end
   local force, forceErr = optionalBoolField(body, "force", false)
@@ -901,7 +969,7 @@ local function h_globalGet(request)
   })
 end
 
-local function h_globalSave(request)
+local function globalWrite(request, preview)
   local body, berr = readBody(request)
   if not body then return berr end
   local email = body.email
@@ -928,6 +996,12 @@ local function h_globalSave(request)
   }
   local baseline, baselineErr = optionalStringField(body, "baseline")
   if baselineErr then return baselineErr end
+  if preview then
+    if baseline == nil then return http.fail("bad_request", "缺少 baseline 参数") end
+    local content, err = apply.mergeGlobal(baseline, form)
+    if not content then return failFrom(err) end
+    return http.ok({ content = content })
+  end
   local force, forceErr = optionalBoolField(body, "force", false)
   if forceErr then return forceErr end
   local res, aerr = apply.writeGlobal(form, {
@@ -951,6 +1025,14 @@ local function h_globalSave(request)
     apply = res.apply,
     backup = res.backup,
   })
+end
+
+local function h_globalSave(request)
+  return globalWrite(request, false)
+end
+
+local function h_globalPreview(request)
+  return globalWrite(request, true)
 end
 
 local function h_globalRaw(request)
@@ -1144,50 +1226,49 @@ local function h_logsService(request)
   })
 end
 
+local function logModel(item)
+  local model = item.model
+  if model and not item.orphan and not item.conflict and not item.drift and sites.generate(model) == item.raw then
+    return model
+  end
+end
+
 local function h_logsSite(request)
   local s = settings.load()
   local slug, serr = queryString(request, "slug", nil)
   if serr then return serr end
-  if type(slug) ~= "string" or util.trim(slug) == "" then
-    return http.fail("bad_request", "缺少 slug 参数", { field = "slug" })
-  end
+  if not slug or util.trim(slug) == "" then return http.fail("bad_request", "缺少 slug 参数", { field = "slug" }) end
   local lines, lerr = queryInt(request, "lines", s.logLines, 100, 2000)
   if lerr then return lerr end
-  local q = queryString(request, "q", nil)
-  if type(q) ~= "string" then q = nil end
+  local q, qerr = queryString(request, "q", nil)
+  if qerr then return qerr end
   local status, sterr = queryInt(request, "status", nil, 100, 599)
   if sterr then return sterr end
+  local statusClass, cerr = queryInt(request, "statusClass", nil, 4, 5)
+  if cerr then return cerr end
   local item, ierr = siteOrFail(slug)
   if not item then return ierr end
-  local domains = {}
-  if type(item.model) == "table" and type(item.model.domains) == "table" then
-    domains = item.model.domains
-  end
-  local note = nil
-  local entries = util.array({})
-  if item.custom then
-    note = "自定义片段没有域名信息"
-  else
-    local pok, res = pcall(logs.siteEntries, s.serviceUnit, domains, lines, {
-      q = q,
-      status = status,
-    })
-    if not pok then
-      return http.fail("internal", "读取站点日志失败：" .. tostring(res))
-    end
-    if type(res) ~= "table" then
-      return http.fail("internal", "读取站点日志失败")
-    end
-    if res.error then return failFrom(res.error, "logs") end
-    entries = util.array(res.entries or {})
-  end
-  return http.ok({
-    slug = slug,
-    domains = util.array(domains),
-    lines = lines,
-    entries = entries,
-    note = note,
+  local model = logModel(item)
+  local ports = model and not model.access and apply.httpPorts(fs.read(s.mainConfig)) or nil
+  local result = logs.siteEntries(s.serviceUnit, model, lines, {
+    q = q, status = status, statusClass = statusClass, ports = ports,
   })
+  result.slug = slug
+  result.domains = util.array(item.domains or {})
+  result.lines = lines
+  return http.ok(result)
+end
+
+local function h_siteCheck(request)
+  local body, err = readBody(request)
+  if not body then return err end
+  local item, ierr = siteOrFail(body.slug)
+  if not item then return ierr end
+  local index = body.index or 1
+  if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > math.max(1, #item.domains) then
+    return http.fail("bad_request", "请选择一个已配置的站点入口", { field = "index" })
+  end
+  return http.ok(sitecheck.run(settings.load(), item, index))
 end
 
 local function compactTimestamp()
@@ -1218,12 +1299,10 @@ local function h_logsExport(request)
     end
     local item, ierr = siteOrFail(slug)
     if not item then return ierr end
-    local domains = {}
-    if type(item.model) == "table" and type(item.model.domains) == "table" then
-      domains = item.model.domains
-    end
+    local model = logModel(item)
+    local ports = model and not model.access and apply.httpPorts(fs.read(s.mainConfig)) or nil
     local pok
-    pok, text, err = pcall(logs.exportText, s.serviceUnit, "site", domains, lines, {})
+    pok, text, err = pcall(logs.exportText, s.serviceUnit, "site", model, lines, { ports = ports })
     if not pok then
       return http.fail("internal", "导出日志失败：" .. tostring(text))
     end
@@ -1249,6 +1328,39 @@ end
 -- ---------------------------------------------------------------------------
 -- Certificates
 -- ---------------------------------------------------------------------------
+
+local function savedEntry(request, internalOnly)
+  local slug = queryString(request, "slug", nil)
+  if not slug then return nil, http.fail("bad_request", "缺少 slug 参数") end
+  local item, err = siteOrFail(slug)
+  if not item then return nil, err end
+  local model = item.model
+  if not model or not model.access or (internalOnly and model.access.protocol ~= "internal") then
+    return nil, http.fail("bad_request", "站点没有所需的访问入口")
+  end
+  if not item.enabled or item.conflict or item.drift or sites.generate(model) ~= item.raw then
+    return nil, http.fail("conflict", "请先保存并启用站点入口")
+  end
+  return model
+end
+
+local function h_entryCheck(request)
+  local model, err = savedEntry(request, false)
+  if not model then return err end
+  local index, queryErr = queryInt(request, "index", 1, 1, #model.domains)
+  if queryErr then return queryErr end
+  return http.ok(certs.checkEntry(model, index, truthyQuery(request.query.get)))
+end
+
+local function h_rootCA(request)
+  local model, err = savedEntry(request, true)
+  if not model then return err end
+  local ca = certs.rootCA(apply.adminAddress(settings.load()))
+  if not ca then
+    return http.fail("service_error", "无法读取运行实例的根 CA。请确认 Caddy 已加载内网 HTTPS，并可通过本机 Admin API 访问。")
+  end
+  return http.ok(ca)
+end
 
 local function h_certs(request)
   local data = sites.loadAll()
@@ -1403,6 +1515,45 @@ local function diagItem(key, label, status, message, details)
   }
 end
 
+local DNS_PROVIDERS = { "dns.providers.cloudflare", "dns.providers.alidns", "dns.providers.tencentcloud" }
+
+local function runningBuild(path, service)
+  local pid = type(service) == "table" and tonumber(service.mainPid)
+  if not pid or pid < 1 or pid % 1 ~= 0 then return "unknown" end
+  local ok, result = pcall(host.process.exec, "cmp", {
+    "-s", "--", path, "/proc/" .. pid .. "/exe",
+  }, { timeoutMs = 4000 })
+  if not ok or not result or result.timedOut or result.error then return "unknown" end
+  if result.exitCode == 0 then return "same" end
+  if result.exitCode == 1 then return "different" end
+  return "unknown"
+end
+
+local function dnsCapacity(modules, service, path)
+  local available, ids = {}, util.array({})
+  for _, id in ipairs(modules.items or {}) do
+    if id:match("^dns%.providers%.[%w_.%-]+$") then available[id] = true end
+  end
+  local listed = {}
+  for _, id in ipairs(DNS_PROVIDERS) do
+    ids[#ids + 1], listed[id] = id, true
+  end
+  local extras = {}
+  for id in pairs(available) do
+    if not listed[id] then extras[#extras + 1] = id end
+  end
+  table.sort(extras)
+  for _, id in ipairs(extras) do ids[#ids + 1] = id end
+
+  local runtime = runningBuild(path, service)
+  local providers = util.array({})
+  for _, id in ipairs(ids) do
+    local status = available[id] and "installed" or modules.ok and not modules.truncated and "missing" or "unknown"
+    providers[#providers + 1] = { id = id, disk = status, running = runtime == "same" and status or "unknown" }
+  end
+  return { runningBuild = runtime, providers = providers }
+end
+
 local function diagnosticsData()
   local s = settings.load()
   local items = util.array({})
@@ -1536,26 +1687,14 @@ local function diagnosticsData()
       bootState = unitDetail.bootState,
       fragmentPath = unitDetail.fragmentPath,
     }))
-    add(diagItem("grant", "服务授权", "ok", "已授权访问 " .. s.serviceUnit))
   else
     local code = type(unitErr) == "table" and unitErr.code or "service_error"
     local message = type(unitErr) == "table" and unitErr.message or "无法读取服务状态"
     local status = "error"
-    if code == "not_found" or code == "grant_missing" or code == "privilege_missing" then
+    if code == "not_found" or code == "privilege_missing" then
       status = "warn"
     end
     add(diagItem("unit", "systemd 单元", status, message, { unit = s.serviceUnit, code = code }))
-    if code == "grant_missing" then
-      add(diagItem("grant", "服务授权", "error", message, {
-        code = code,
-        hint = "部署授权文件未包含该单元/操作",
-      }))
-    else
-      add(diagItem("grant", "服务授权", "unknown", "无法判断授权状态", {
-        code = code,
-        message = message,
-      }))
-    end
   end
 
   local lpok, logLines, logErr = pcall(services.logs, s.serviceUnit, 10)
@@ -1565,19 +1704,12 @@ local function diagnosticsData()
     local code = type(logErr) == "table" and logErr.code or "journal_unavailable"
     local message = type(logErr) == "table" and logErr.message or "无法读取 journald 日志"
     if not lpok then message = tostring(logLines) end
-    local hint = "宿主账号需加入 systemd-journal 组"
-    if code == "grant_missing" then
-      hint = "服务授权未包含 logs 操作；请在 grants 中为 caddy.service 添加 logs"
-    elseif code == "service_error" then
-      hint = "服务后端不可用；检查 systemd 与 host.services"
-    end
     add(diagItem("journal", "journald 日志", "warn", message, {
       code = code,
-      hint = hint,
     }))
   end
 
-  add(diagItem("sudo", "服务提权", "unknown", "通过启动/停止操作的错误提示判断"))
+  add(diagItem("sudo", "服务提权", "unknown", "由系统 sudoers 决定，通过启动、停止或重启的结果确认"))
 
   local modulesField = {
     items = util.array({}),
@@ -1587,6 +1719,7 @@ local function diagnosticsData()
   local modulesRes = caddy.modules()
   if type(modulesRes) == "table" and modulesRes.ok then
     local list = modulesRes.items or {}
+    modulesField.ok = true
     modulesField.items = util.array(list)
     modulesField.truncated = modulesRes.truncated and true or false
     local l4, ratelimit, dns = false, false, false
@@ -1645,6 +1778,7 @@ local function diagnosticsData()
     config = util.array(settings.effective()),
     caddy = caddyField,
     modules = modulesField,
+    dns = dnsCapacity(modulesField, unitDetail, s.caddyBinary),
     validate = validateField,
   }
 end
@@ -1672,12 +1806,15 @@ end
 -- ---------------------------------------------------------------------------
 
 M.routes = util.array({
+  { method = "GET", path = "/local-listeners", handler = h_localListeners },
+  { method = "POST", path = "/local-listeners/probe", handler = h_probeListener },
   { method = "GET", path = "/health", handler = h_health },
   { method = "GET", path = "/overview", handler = h_overview },
   { method = "GET", path = "/sites", handler = h_sites },
   { method = "GET", path = "/site", handler = h_site },
   { method = "POST", path = "/site", handler = h_siteCreate },
   { method = "POST", path = "/site/update", handler = h_siteUpdate },
+  { method = "POST", path = "/site/preview", handler = h_sitePreview },
   { method = "POST", path = "/site/raw", handler = h_siteRaw },
   { method = "POST", path = "/site/validate", handler = h_siteValidate },
   { method = "POST", path = "/site/enable", handler = h_siteEnable },
@@ -1685,6 +1822,7 @@ M.routes = util.array({
   { method = "POST", path = "/site/delete", handler = h_siteDelete },
   { method = "GET", path = "/global", handler = h_globalGet },
   { method = "POST", path = "/global", handler = h_globalSave },
+  { method = "POST", path = "/global/preview", handler = h_globalPreview },
   { method = "POST", path = "/global/raw", handler = h_globalRaw },
   { method = "POST", path = "/config/validate", handler = h_configValidate },
   { method = "POST", path = "/config/fmt", handler = h_configFmt },
@@ -1697,6 +1835,11 @@ M.routes = util.array({
   { method = "GET", path = "/logs/service", handler = h_logsService },
   { method = "GET", path = "/logs/site", handler = h_logsSite },
   { method = "GET", path = "/logs/export", handler = h_logsExport },
+  { method = "GET", path = "/site/entry-check", handler = h_entryCheck },
+  { method = "POST", path = "/site/check", handler = h_siteCheck },
+  { method = "GET", path = "/metrics", handler = function() return http.ok(metrics.get(settings.load(), false)) end },
+  { method = "POST", path = "/metrics", handler = function() return http.ok(metrics.get(settings.load(), true)) end },
+  { method = "GET", path = "/site/root-ca", handler = h_rootCA },
   { method = "GET", path = "/certs", handler = h_certs },
   { method = "POST", path = "/certs/refresh", handler = h_certsRefresh },
   { method = "GET", path = "/backups", handler = h_backups },

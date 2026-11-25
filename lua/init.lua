@@ -4,6 +4,8 @@ local api = require("api")
 local http = require("http")
 local store = require("store")
 local certs = require("certs")
+local metrics = require("metrics")
+local settings = require("settings")
 
 for _, r in ipairs(api.routes) do
   host.app.route(r.method, r.path, http.wrap(r.handler))
@@ -13,4 +15,5 @@ host.app.on("start", function()
   local ok, err = pcall(store.ensure)
   if not ok then print("store ensure failed: "..tostring(err)) end
   pcall(certs.schedule)
+  metrics.schedule(settings.load())
 end)

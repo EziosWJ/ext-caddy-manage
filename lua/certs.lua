@@ -3,6 +3,7 @@ local util = require("util")
 local store = require("store")
 local sites = require("sites")
 local settings = require("settings")
+local caddy = require("caddy")
 
 local M = {}
 
@@ -84,41 +85,7 @@ local function parseNotAfter(value)
   return formatted .. "Z"
 end
 
--- Probe a domain's live certificate. Never throws; errors are in the result.
-function M.probe(domain)
-  if type(domain) ~= "string" or domain == "" then return probeError("域名无效") end
-
-  local okConnect, connect, connectErr = pcall(host.process.exec, "openssl", {
-    "s_client",
-    "-connect", domain .. ":443",
-    "-servername", domain,
-    "-showcerts",
-  }, { timeoutMs = 8000 })
-  if not okConnect then
-    return probeError("无法执行 openssl：" .. tostring(connect))
-  end
-  if not connect then
-    return probeError("无法执行 openssl：" .. tostring(connectErr))
-  end
-  if connect.timedOut then
-    return probeError("TLS 探测超时（8000 ms）")
-  end
-  if connect.error then
-    return probeError("TLS 探测失败：" .. tostring(connect.error))
-  end
-  if connect.exitCode ~= 0 then
-    local line = firstNonEmptyLine(connect.stderr, 500)
-    if line == "" then line = "openssl s_client 退出码 " .. tostring(connect.exitCode) end
-    return probeError(friendlyConnectError(line))
-  end
-
-  local pem = extractPem(connect.stdout)
-  if not pem then
-    local line = firstNonEmptyLine(connect.stderr, 500)
-    if line == "" then line = "未获取到证书 PEM" end
-    return probeError(friendlyConnectError(line))
-  end
-
+local function certificateDetails(pem)
   local okX509, x509, x509Err = pcall(host.process.exec, "openssl", {
     "x509", "-noout", "-subject", "-issuer", "-enddate",
   }, { stdin = pem, timeoutMs = 5000 })
@@ -157,6 +124,152 @@ function M.probe(domain)
     return probeError("无法解析证书到期时间：" .. clip(notAfterValue, 200))
   end
   return { issuer = issuer, notAfter = notAfter, error = "" }
+end
+
+-- Probe a domain's live certificate. Never throws; errors are in the result.
+function M.probe(domain)
+  if type(domain) ~= "string" or domain == "" then return probeError("域名无效") end
+
+  local okConnect, connect, connectErr = pcall(host.process.exec, "openssl", {
+    "s_client",
+    "-connect", domain .. ":443",
+    "-servername", domain,
+    "-showcerts",
+  }, { timeoutMs = 8000 })
+  if not okConnect then
+    return probeError("无法执行 openssl：" .. tostring(connect))
+  end
+  if not connect then
+    return probeError("无法执行 openssl：" .. tostring(connectErr))
+  end
+  if connect.timedOut then
+    return probeError("TLS 探测超时（8000 ms）")
+  end
+  if connect.error then
+    return probeError("TLS 探测失败：" .. tostring(connect.error))
+  end
+  if connect.exitCode ~= 0 then
+    local line = firstNonEmptyLine(connect.stderr, 500)
+    if line == "" then line = "openssl s_client 退出码 " .. tostring(connect.exitCode) end
+    return probeError(friendlyConnectError(line))
+  end
+
+  local pem = extractPem(connect.stdout)
+  if not pem then
+    local line = firstNonEmptyLine(connect.stderr, 500)
+    if line == "" then line = "未获取到证书 PEM" end
+    return probeError(friendlyConnectError(line))
+  end
+
+  return certificateDetails(pem)
+end
+
+local function exec(program, args, stdin, timeout)
+  local ok, result = pcall(host.process.exec, program, args, { timeoutMs = timeout or 6000, stdin = stdin or "" })
+  if not ok or not result or result.timedOut or result.error then return nil end
+  return result
+end
+
+local function bracket(address)
+  return address:find(":", 1, true) and ("[" .. address .. "]") or address
+end
+
+-- Pin the local listener while preserving the certificate identity and HTTP Host.
+function M.entryTarget(model, index)
+  local name, access = model.domains[index], model.access
+  local address = access.bindAddress or (name:find(":", 1, true) and "::1" or "127.0.0.1")
+  local port = sites.accessPort(access)
+  return {
+    name = name, address = address, port = port, target = bracket(address) .. ":" .. port,
+    url = sites.accessUrls(model)[index], protocol = access.protocol,
+  }
+end
+
+function M.checkTLS(entry, result, details, timeout)
+  if entry.protocol == "http" then
+    result.issuance, result.trust = "not_applicable", "not_applicable"
+    return
+  end
+  local name = entry.name
+  local args = { "s_client", "-connect", entry.target, "-showcerts" }
+  if sites.canonicalIP(name) then
+    args[#args + 1] = "-verify_ip"
+  else
+    args[#args + 1] = "-servername"
+    args[#args + 1] = name
+    args[#args + 1] = "-verify_hostname"
+  end
+  args[#args + 1] = name
+  local tls = exec("openssl", args, nil, timeout)
+  local pem = tls and extractPem(tls.stdout)
+  if not pem then
+    result.error = "本机 TLS 握手未取得证书。请检查监听和签发状态后重试。"
+    result.output = tls and firstNonEmptyLine(tls.stderr, 500) or nil
+    return
+  end
+  result.connected, result.issuance = true, "presented"
+  if details then result.certificate = certificateDetails(pem) end
+  local verify = tls.stdout:match("Verify return code: (%d+)")
+  if verify then result.trust = verify == "0" and "trusted" or "untrusted" end
+  result.verifyCode = tonumber(verify)
+end
+
+function M.checkHTTP(entry, result, get, timeout)
+  local args = {
+    "-q", "--silent", "--show-error", "--noproxy", "*", "--proto", "=http,https",
+    "--max-time", timeout and tostring((timeout - 250) / 1000) or "4", "--globoff",
+    "--connect-to", bracket(entry.name) .. ":" .. entry.port .. ":" .. entry.target,
+    "--output", "/dev/null", "--write-out", "%{http_code}",
+  }
+  if get then
+    args[#args + 1] = "--max-filesize"
+    args[#args + 1] = "1024"
+  else
+    args[#args + 1] = "--head"
+  end
+  args[#args + 1] = "--"
+  args[#args + 1] = entry.url
+  local response = exec("curl", args, nil, timeout)
+  local status = response and (get or response.exitCode == 0) and tonumber(response.stdout)
+  if status and status >= 100 and status <= 599 then
+    result.connected, result.httpStatus = true, status
+  else
+    result.error = result.trust == "untrusted" and "宿主未信任证书，HTTP 响应未验证。"
+      or "本机未收到 HTTP 响应。请检查监听、证书信任和站点配置后重试。"
+    result.output = response and firstNonEmptyLine(response.stderr, 500) or nil
+  end
+end
+
+function M.checkEntry(model, index, get)
+  local entry = M.entryTarget(model, index)
+  local result = {
+    url = entry.url, target = entry.target, checkedAt = util.nowUTC(),
+    connected = false, issuance = "unknown", trust = "unknown",
+  }
+  M.checkTLS(entry, result, true)
+  if not result.error then M.checkHTTP(entry, result, get) end
+  return result
+end
+
+-- Request only the public PKI projection of the configured local admin API.
+-- Disable curl config files, proxies and redirects, and never return its output on failure.
+function M.rootCA(address)
+  local endpoint, localArgs = caddy.localAdminEndpoint(address)
+  if not endpoint then return nil end
+  local args = { "-q", "--silent", "--fail", "--noproxy", "*", "--proto", "=http",
+    "--max-time", "4", "--max-filesize", "16384" }
+  for _, value in ipairs(localArgs) do args[#args + 1] = value end
+  args[#args + 1] = endpoint .. "/pki/ca/local"
+  local response = exec("curl", args)
+  if not response or response.exitCode ~= 0 or response.stdoutTruncated then return nil end
+  local ok, data = pcall(util.jsonDecode, response.stdout)
+  if not ok or type(data) ~= "table" or data.id ~= "local" then return nil end
+  local pem = extractPem(data.root_certificate)
+  if not pem then return nil end
+  local info = exec("openssl", { "x509", "-noout", "-sha256", "-fingerprint" }, pem .. "\n")
+  local fingerprint = info and info.exitCode == 0 and info.stdout:match("=([%x:]+)")
+  if not fingerprint or #fingerprint ~= 95 then return nil end
+  return { pem = pem .. "\n", fingerprint = fingerprint }
 end
 
 local function cacheMap()

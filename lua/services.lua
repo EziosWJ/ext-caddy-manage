@@ -9,30 +9,28 @@ local function clip(s, limit)
   return s
 end
 
--- Map a host.service error message to a plugin error code plus Chinese hint.
+-- Host service errors are formatted as host.services.<method>: <code>: <message>.
 function M.mapError(message)
   local raw = clip(message, 800)
   -- Drop the Lua chunk prefix (".../services.lua:52: ") from pcall errors.
   raw = raw:gsub("^.-%.lua:%d+: ", "", 1)
-  local low = string.lower(raw)
   local code, hint
-  local function has(needle)
-    return string.find(low, needle, 1, true) ~= nil
-  end
+  local method, hostCode = raw:match("^host%.services%.(%w+): ([%w_]+):")
 
-  if has("not authorized") or has("no service grant") or has("no capability grant") or has("forbidden") then
-    code = "grant_missing"
-    hint = "服务授权不足：部署授权文件未包含该单元/操作"
-  elseif has("logs_unavailable") or has("journal") then
+  if hostCode == "logs_unavailable" then
     code = "journal_unavailable"
-    hint = "日志不可用：宿主账号需加入 systemd-journal 组"
-  elseif has("host.services.logs") and (has("permission") or has("denied") or has("access denied")) then
+    hint = "日志不可用：请检查宿主环境中的 journalctl"
+  elseif method == "logs" and hostCode == "permission" then
     code = "journal_unavailable"
-    hint = "日志不可用：宿主账号需加入 systemd-journal 组"
-  elseif has("permission") or has("sudoers") or has("sudo") or has("elevat") then
+    hint = "日志读取权限不足：请检查宿主账号的 systemd-journal 组权限"
+  elseif hostCode == "permission" then
     code = "privilege_missing"
-    hint = "权限不足：宿主账号缺少 sudoers 规则"
-  elseif has("not_found") or has("not found") or string.find(raw, "服务不存在", 1, true) then
+    if method == "start" or method == "stop" or method == "restart" then
+      hint = "服务操作权限不足：请检查宿主账号的权限与系统 sudoers 配置"
+    else
+      hint = "服务查询权限不足：请检查宿主账号的 systemd 读取权限"
+    end
+  elseif hostCode == "not_found" then
     code = "not_found"
     hint = "服务不存在"
   else
@@ -71,7 +69,7 @@ end
 
 local function action(name, unit)
   if type(unit) ~= "string" or unit == "" then return nil, serviceError("服务单元无效") end
-  local ok, result = pcall(function() return host.services[name](unit) end)
+  local ok, result = pcall(function() return host.services[name](unit, { sudo = true }) end)
   if not ok then return nil, M.mapError(result) end
   if result == false or result == nil then
     return nil, serviceError("服务" .. name .. "操作未成功")

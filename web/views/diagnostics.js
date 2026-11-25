@@ -13,13 +13,15 @@ import {
   formatDetails,
   icon,
   loadingBlock,
+  linkButton,
+  selectField,
   metaGrid,
   pageHeader,
   section,
   statTile,
   toast,
 } from "../components.js";
-import { fmtBytes } from "../format.js";
+import { fmtBytes, fmtDateTime } from "../format.js";
 
 const STATUS_META = {
   ok: { label: "正常", tone: "success", icon: "check-circle", className: "is-ok" },
@@ -31,14 +33,134 @@ const STATUS_META = {
 const MODULE_OPTIONAL = [
   { key: "l4", label: "l4 四层代理" },
   { key: "ratelimit", label: "ratelimit 限流" },
-  { key: "dns", label: "DNS-01 提供商" },
 ];
 
 function statusMeta(status) {
   return STATUS_META[status] || STATUS_META.unknown;
 }
 
-export async function mount(root, ctx) {
+const SITE_STAGES = {
+  dns: "宿主 DNS", listen: "监听及端口归属", tls: "TLS、SNI 和信任",
+  upstream: "上游连通", http: "HTTP 响应", config: "磁盘配置",
+};
+
+function siteCheckCard(preselected) {
+  const resultArea = el("div", { class: "ecm-stack", "aria-live": "polite" });
+  const selection = selectField({ label: "站点", options: [], value: "" });
+  const entry = selectField({ label: "访问入口", options: [], value: "" });
+  const run = button("执行链路检查", { variant: "primary", icon: "activity", disabled: true, onClick: check });
+  const controls = el("div", { class: "ecm-stack" },
+    el("div", { class: "ecm-diag-grid" }, selection.root, entry.root),
+    el("div", { class: "ecm-toolbar" }, run),
+    resultArea,
+  );
+  const card = section({
+    title: "检查站点",
+    help: "从 Extension Host 所在机器检查已配置入口。HTTP 检查发送 HEAD /，入口连接固定到本机监听并保留域名或 IP 身份。",
+    children: controls,
+  });
+  const bySlug = new Map();
+
+  function updateEntries() {
+    const site = bySlug.get(selection.control.value);
+    const addresses = site?.domains || [];
+    const options = addresses.map((domain, index) => ({
+      value: String(index + 1),
+      label: site.urls?.length === addresses.length ? site.urls[index] : domain,
+    }));
+    if (!options.length) options.push({ value: "1", label: "仅检查配置" });
+    entry.control.replaceChildren(...options.map(({ value, label }) => el("option", { value }, label)));
+    entry.control.disabled = !site || options.length === 1;
+    run.disabled = !site;
+    resultArea.replaceChildren();
+  }
+
+  selection.control.addEventListener("change", updateEntries);
+  entry.control.addEventListener("change", () => resultArea.replaceChildren());
+
+  async function loadSites() {
+    resultArea.replaceChildren(loadingBlock("正在读取站点…"));
+    selection.control.disabled = true;
+    entry.control.disabled = true;
+    try {
+      const { items } = await api.sites();
+      for (const site of items) bySlug.set(site.slug, site);
+      selection.control.replaceChildren(
+        el("option", { value: "" }, "选择站点"),
+        ...items.map((site) => el("option", { value: site.slug }, site.name || site.slug)),
+      );
+      selection.control.disabled = !items.length;
+      if (bySlug.has(preselected)) selection.control.value = preselected;
+      updateEntries();
+      if (!items.length) resultArea.append(feedback("请先创建站点，再执行链路检查。", "info", {
+        action: linkButton("新建站点", "#/sites/new", { compact: true }),
+      }));
+    } catch (error) {
+      resultArea.replaceChildren(errorBlock(error, { title: "读取站点失败", onRetry: loadSites }));
+    }
+  }
+
+  async function check() {
+    const slug = selection.control.value;
+    buttonBusy(run, true, "检查中…");
+    selection.control.disabled = true;
+    entry.control.disabled = true;
+    resultArea.replaceChildren(loadingBlock("正在检查站点链路…"));
+    try {
+      const result = await api.siteCheck(slug, Number(entry.control.value));
+      const siteHref = `#/sites/${encodeURIComponent(slug)}`;
+      const next = {
+        site: ["查看站点配置", siteHref],
+        tls: ["查看证书与信任指引", `${siteHref}?section=tls`],
+        global: ["查看全局配置", "#/global"],
+      };
+      const actionFor = (step) => {
+        const action = next[step.action];
+        return action ? linkButton(action[0], action[1], { compact: true }) : null;
+      };
+      const first = result.steps.find((step) => step.id === result.firstFailure)
+        || result.steps.find((step) => step.status === "unknown");
+      resultArea.replaceChildren(metaGrid([
+        { label: "检查时间（宿主视角）", value: fmtDateTime(result.checkedAt, { seconds: true }) },
+        { label: "访问入口", value: result.url, mono: true },
+        { label: "本机探测目标", value: result.target, mono: true },
+      ]));
+      if (first) {
+        const tone = first.status === "error" ? "danger" : "warning";
+        const prefix = first.status === "error" ? "优先处理" : "待确认";
+        resultArea.append(feedback(`${prefix} · ${SITE_STAGES[first.id]}。 ${first.message}`, tone, { action: actionFor(first) }));
+      }
+      const steps = el("ol", { class: "ecm-checklist" });
+      for (const step of result.steps) {
+        const info = step.status === "skipped" ? { label: "已跳过", tone: "neutral", icon: "minus", className: "is-unknown" }
+          : statusMeta(step.status);
+        steps.append(el("li", { class: `ecm-checkitem ${info.className}` },
+          el("span", { class: "ecm-checkitem-icon", "aria-hidden": "true" }, icon(info.icon, 18)),
+          el("div", { class: "ecm-checkitem-main" },
+            el("div", { class: "ecm-checkitem-head" }, SITE_STAGES[step.id], badge(info.label, info.tone)),
+            el("p", { class: "ecm-checkitem-message" }, step.message),
+            step !== first ? actionFor(step) : null,
+            step.output ? el("details", { class: "ecm-details ecm-details-inline" },
+              el("summary", null, "原始输出"), el("pre", { class: "ecm-pre ecm-pre-sm" }, step.output)) : null,
+          ),
+        ));
+      }
+      resultArea.append(steps);
+    } catch (error) {
+      resultArea.replaceChildren(feedback(error.message || "站点检查失败。", "danger"));
+    } finally {
+      selection.control.disabled = false;
+      entry.control.disabled = entry.control.options.length === 1;
+      buttonBusy(run, false);
+      if (run.isConnected && document.activeElement === document.body) run.focus();
+    }
+  }
+
+  loadSites();
+  return card;
+}
+
+export async function mount(root, ctx, route) {
   const page = el("div", { class: "ecm-page" });
   root.append(page);
 
@@ -59,13 +181,12 @@ export async function mount(root, ctx) {
 
   const header = pageHeader({
     title: "诊断",
-    subtitle: "检查 Caddy 二进制、目录、权限、服务授权与整体配置。",
     backHref: "#/overview",
     backLabel: "概览",
     actions: [refreshBtn, initBtn],
   });
   const content = el("div", { class: "ecm-stack" });
-  page.append(header, content);
+  page.append(header, siteCheckCard(route.slug), content);
 
   function buildSummary(summary) {
     const s = summary || {};
@@ -82,7 +203,6 @@ export async function mount(root, ctx) {
   function buildChecklist(items) {
     const card = section({
       title: "检查清单",
-      description: "每一项都来自实时读取或 Caddy 命令输出；详细信息可展开查看。",
       children: [],
     });
     const body = card.querySelector(".ecm-card-body");
@@ -152,6 +272,52 @@ export async function mount(root, ctx) {
         { label: "站点根目录", value: p.sitesRoot || "—", mono: true },
         { label: "备份目录", value: p.backupsDir || "—", mono: true },
       ]),
+    });
+  }
+
+  function buildDnsCard(dns) {
+    const stateLabels = {
+      installed: ["已安装", "success"],
+      missing: ["未安装", "warning"],
+      unknown: ["无法确认", "neutral"],
+    };
+    function moduleStatus(value) {
+      const [label, tone] = stateLabels[value] || stateLabels.unknown;
+      return badge(label, tone, { dot: true });
+    }
+    const build = {
+      same: "磁盘二进制与服务进程的可执行文件一致。",
+      different: "服务进程使用不同构建。请确认 systemd 的 ExecStart 并核对运行构建。",
+      unknown: "未能读取或比较服务进程的可执行文件。请管理员核对服务的 MainPID 和磁盘二进制。",
+    };
+    return section({
+      title: "DNS-01 提供商",
+      children: el("div", { class: "ecm-stack" },
+        el("p", { class: "ecm-hint" }, build[dns.runningBuild] || build.unknown),
+        dataTable({
+          label: "DNS-01 模块检测",
+          columns: [
+            { key: "id", label: "模块 ID", mono: true },
+            { key: "disk", label: "磁盘构建", render: (row) => moduleStatus(row.disk) },
+            { key: "running", label: "运行构建", render: (row) => moduleStatus(row.running) },
+          ],
+          rows: dns.providers || [],
+        }),
+        el("details", { class: "ecm-details" },
+          el("summary", null, "部署与验收"),
+          el("div", { class: "ecm-details-body ecm-stack" },
+            el("p", null, "优先验证 Cloudflare。管理员用固定版本的 xcaddy、Caddy 和 provider 构建二进制，并限制令牌只能管理指定区域的 DNS。"),
+            el("p", null, "将凭据放在受保护的服务环境文件中。Caddyfile 通过 {env.CLOUDFLARE_API_TOKEN} 引用。启动参数去掉 --environ，避免把服务环境写进日志。"),
+            el("p", null, "先校验配置，再测试服务装载及回滚。用 ACME staging 验证签发和续期。通配符用具体子域名探测，根域单独签发并验证。"),
+            el("a", {
+              class: "ecm-link",
+              href: "https://github.com/EziosWJ/ext-caddy-manage/blob/main/deploy/README.md",
+              target: "_blank",
+              rel: "noopener noreferrer",
+            }, "部署手册"),
+          ),
+        ),
+      ),
     });
   }
 
@@ -226,7 +392,7 @@ export async function mount(root, ctx) {
   function buildValidateCard(validate) {
     const card = section({
       title: "整体配置校验",
-      description: "调用 caddy validate --adapter caddyfile 校验当前主配置及其 import。",
+      help: "校验主 Caddyfile 及其导入的片段。",
       children: [],
     });
     const body = card.querySelector(".ecm-card-body");
@@ -271,13 +437,9 @@ export async function mount(root, ctx) {
     grid.append(buildConfigCard(data.config));
     grid.append(buildPathsCard(data.paths));
     content.append(grid);
-    content.append(buildModulesCard(data.modules));
+    content.append(buildDnsCard(data.dns || {}), buildModulesCard(data.modules));
     content.append(buildValidateCard(data.validate));
 
-    if (data.caddy && data.caddy.version) {
-      header.querySelector(".ecm-page-sub").textContent =
-        `检测到 Caddy ${data.caddy.version}；检查 Caddy 二进制、目录、权限、服务授权与整体配置。`;
-    }
     ctx.setTitle("诊断");
   }
 

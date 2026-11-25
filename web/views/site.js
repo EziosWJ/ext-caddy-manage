@@ -7,16 +7,17 @@ import {
   chips,
   codeBlock,
   confirmDialog,
-  conflictDialog,
   dataTable,
   el,
   emptyState,
   errorBlock,
   feedback,
+  helpTip,
   icon,
   inputField,
   loadingBlock,
   logViewer,
+  linkButton,
   metaGrid,
   openDialog,
   pageHeader,
@@ -25,6 +26,7 @@ import {
   selectField,
   switchField,
   textareaField,
+  tabs,
   toast,
 } from "../components.js";
 import {
@@ -35,6 +37,12 @@ import {
   fmtRelative,
   typeLabel,
 } from "../format.js";
+import {
+  configurationToolbar, rememberEditorMode, savedEditorMode, saveReviewedForm, viewConfiguration,
+} from "./configuration.js";
+
+import { accessDraft, accessFields, accessModel } from "./access.js";
+import { routingDraft, routingEditor, routingModel } from "./routing.js";
 
 const LB_OPTIONS = [
   { value: "round_robin", label: "轮询（round_robin）" },
@@ -63,6 +71,48 @@ function parseLines(text) {
     .split("\n")
     .map((value) => value.trim())
     .filter((value) => value !== "");
+}
+
+const PROXY_ADDRESS = /^(?:https?:\/\/)?(?:[\w.-]+|\[[\da-f:.]+\]):\d+$/i;
+
+function isDomain(address) {
+  if (address.length > 253 || /^\d+\.\d+\.\d+\.\d+$/.test(address)) return false;
+  return address.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
+}
+
+// Summarize a single straightforward proxy block. Complex routing and imports
+// are left to the source viewer so the header never guesses a destination.
+function proxyRouteFromFile(raw) {
+  const lines = parseLines(raw).filter((line) => !line.startsWith("#"));
+  const header = lines.shift()?.match(/^([\w.:/-]+) \{$/);
+  if (!header || lines.pop() !== "}") return null;
+
+  let entry = header[1];
+  let upstreams;
+  let inProxy = false;
+  for (const line of lines) {
+    if (inProxy) {
+      if (line === "}") inProxy = false;
+      else if (!/^(lb_policy|health_uri|health_interval|health_timeout|health_status) [^{}]+$/.test(line)) return null;
+      continue;
+    }
+    const bind = line.match(/^bind (0\.0\.0\.0|127\.0\.0\.1)$/);
+    const listener = entry.match(/^http:\/\/(127\.0\.0\.1|localhost)?:(\d+)$/);
+    if (bind && listener && (!listener[1] || bind[1] === "127.0.0.1")) {
+      if (!listener[1]) entry = `http://${bind[1]}:${listener[2]}`;
+      continue;
+    }
+    const proxy = line.match(/^reverse_proxy (.+?)( \{)?$/);
+    if (proxy && !upstreams) {
+      upstreams = proxy[1].split(/\s+/);
+      if (!upstreams.every((address) => PROXY_ADDRESS.test(address))) return null;
+      inProxy = Boolean(proxy[2]);
+      continue;
+    }
+    if (!/^(encode [\w -]+|log(?: [\w-]+)?)$/.test(line)) return null;
+  }
+  if (inProxy || !upstreams || !/^(?:https?:\/\/)?(?:[\w.-]+)?(?::\d+)?$/.test(entry)) return null;
+  return { entry, upstreams };
 }
 
 function backupReasonLabel(reason) {
@@ -104,7 +154,9 @@ function normalizeModel(detail) {
         : Array.isArray(detail.domains)
           ? detail.domains.map(String)
           : [],
-    https: typeof source.https === "boolean" ? source.https : true,
+    access: accessDraft(source.access, source.https !== false, true),
+    routed: Boolean(source.routing),
+    routing: source.routing ? routingDraft(source.routing) : null,
     group: typeof source.group === "string" ? source.group : detail.group || "",
     note: typeof source.note === "string" ? source.note : detail.note || "",
     static: {
@@ -155,6 +207,7 @@ function normalizeModel(detail) {
 
 export async function mount(root, ctx, route) {
   const slug = route.slug;
+  const modeKey = `ecm:editor:${location.pathname}:site:${slug}`;
   let detail = null;
   let globalInfo = null;
   let form = null;
@@ -169,6 +222,9 @@ export async function mount(root, ctx, route) {
   let dirtyIndicator = null;
   let topMessages = null;
   let ui = {};
+  let activeTab = "config";
+  let mode = route.section === "tls" ? "form" : savedEditorMode(modeKey);
+  let reviewForm = false;
 
   const page = el("div", { class: "ecm-page ecm-detail-page" });
   root.append(page);
@@ -251,10 +307,12 @@ export async function mount(root, ctx, route) {
       name: form.name.trim(),
       type: detail.type,
       domains: form.domains.map((domain) => domain.trim()).filter(Boolean),
-      https: Boolean(form.https),
+      https: form.access.protocol !== "http",
       group: form.group.trim() || "默认",
       note: form.note,
     };
+    const access = accessModel(form.access);
+    if (access) model.access = access;
     if (detail.type === "static") {
       model.static = {
         root: form.static.root.trim(),
@@ -271,7 +329,8 @@ export async function mount(root, ctx, route) {
             status: Number(form.proxy.health.status) || 0,
           }
         : { enabled: false };
-      model.proxy = {
+      if (form.routed) model.routing = routingModel(form.routing);
+      if (!form.routed || form.proxy.upstreams.length) model.proxy = {
         upstreams: form.proxy.upstreams.map((value) => value.trim()).filter(Boolean),
         lbPolicy: form.proxy.lbPolicy,
         health,
@@ -313,7 +372,9 @@ export async function mount(root, ctx, route) {
     if (path === "name") return refs.name;
     if (path === "group") return refs.group;
     if (path === "note") return refs.note;
-    if (path === "https") return refs.https;
+    if (path === "https") return refs.protocol;
+    if (path.startsWith("access.")) return refs[path.split(".")[1]];
+    if (path.startsWith("routing")) return refs.routingFields?.[path] || refs.routingFields?.routing;
     if (path === "domains" || path.startsWith("domains.")) return refs.domains;
     if (path.startsWith("static.root")) return refs.root;
     if (path.startsWith("proxy.upstreams")) return refs.upstreams;
@@ -342,6 +403,7 @@ export async function mount(root, ctx, route) {
     if (typeof fieldApi.setError === "function") fieldApi.setError(message || "该字段无效。");
     const control = fieldApi.control;
     if (control) {
+      control.closest("details")?.setAttribute("open", "");
       control.focus();
       control.scrollIntoView({ block: "center", behavior: "smooth" });
     }
@@ -437,35 +499,23 @@ export async function mount(root, ctx, route) {
       },
     });
     const domainsField = textareaField({
-      label: "域名",
+      label: "站点地址",
       value: form.domains.join("\n"),
       rows: 4,
       mono: true,
-      hint: "每行一个域名。域名全站唯一，不支持通配符、端口或 IP。",
+      placeholder: "example.com\n192.168.1.10\nfd00::10",
+      hint: "每行填写一个客户端使用的域名或 IP。沿用旧版规则时保留原有地址格式。",
       onInput: (value) => {
         form.domains = parseLines(value);
+        refs.updateHttps?.();
         updateDirty();
       },
     });
     domainsField.root.classList.add("ecm-field-full");
-    const noteField = textareaField({
-      label: "备注",
-      value: form.note,
-      rows: 3,
-      maxLength: 2000,
-      placeholder: "可选",
-      onInput: (value) => {
-        form.note = value;
-        updateDirty();
-      },
-    });
-    noteField.root.classList.add("ecm-field-full");
-    grid.append(nameField.root, groupField.root, domainsField.root, noteField.root);
-
+    grid.append(domainsField.root);
     refs.name = nameField;
     refs.group = groupField;
     refs.domains = domainsField;
-    refs.note = noteField;
 
     if (detail.type === "static") {
       const rootField = inputField({
@@ -483,7 +533,6 @@ export async function mount(root, ctx, route) {
       rootField.root.classList.add("ecm-field-full");
       const browseField = switchField({
         label: "目录浏览",
-        hint: "生成 file_server browse。",
         checked: form.static.browse,
         onChange: (checked) => {
           form.static.browse = checked;
@@ -492,7 +541,7 @@ export async function mount(root, ctx, route) {
       });
       const spaField = switchField({
         label: "SPA 回退",
-        hint: "生成 try_files {path} /index.html。",
+        hint: "将不存在的路径重写到 /index.html。",
         checked: form.static.spa,
         onChange: (checked) => {
           form.static.spa = checked;
@@ -501,31 +550,6 @@ export async function mount(root, ctx, route) {
       });
       grid.append(rootField.root, browseField.root, spaField.root);
       refs.root = rootField;
-    } else if (detail.type === "proxy") {
-      const upstreamsField = textareaField({
-        label: "上游地址",
-        value: form.proxy.upstreams.join("\n"),
-        rows: 4,
-        mono: true,
-        hint: "每行一个上游，支持 host:port、http(s)://host:port、[v6]:port，最多 20 个。",
-        onInput: (value) => {
-          form.proxy.upstreams = parseLines(value);
-          updateDirty();
-        },
-      });
-      upstreamsField.root.classList.add("ecm-field-full");
-      const lbField = selectField({
-        label: "负载均衡策略",
-        options: LB_OPTIONS,
-        value: form.proxy.lbPolicy,
-        onChange: (value) => {
-          form.proxy.lbPolicy = value;
-          updateDirty();
-        },
-      });
-      grid.append(upstreamsField.root, lbField.root);
-      refs.upstreams = upstreamsField;
-      refs.lbPolicy = lbField;
     } else if (detail.type === "redirect") {
       const targetField = inputField({
         label: "重定向目标",
@@ -555,10 +579,26 @@ export async function mount(root, ctx, route) {
     }
 
     return section({
-      title: "基本信息",
-      description: `类型：${typeLabel(detail.type)}（创建后不可修改）`,
-      children: grid,
+      title: "站点入口",
+      children: [grid, el("div", { class: "ecm-form-grid ecm-subsection" }, nameField.root, groupField.root)],
     });
+  }
+
+  function buildNotesSection() {
+    const noteField = textareaField({
+      label: "备注",
+      value: form.note,
+      rows: 3,
+      maxLength: 2000,
+      placeholder: "可选",
+      onInput: (value) => {
+        form.note = value;
+        updateDirty();
+      },
+    });
+    refs.note = noteField;
+    return el("details", { class: "ecm-details" },
+      el("summary", null, "备注"), el("div", { class: "ecm-details-body" }, noteField.root));
   }
 
   function certBadge(certRow) {
@@ -569,108 +609,205 @@ export async function mount(root, ctx, route) {
   }
 
   function buildHttpsSection() {
-    const editable = !detail.custom && !detail.orphan && !detail.modelError;
-    const refreshBtn = button("刷新证书", {
-      variant: "secondary",
-      icon: "refresh-cw",
-      compact: true,
-      disabled: detail.orphan || detail.custom,
-      onClick: async () => {
-        if (!(await confirmDiscard())) return;
-        buttonBusy(refreshBtn, true, "探测中…");
-        try {
-          const result = await api.refreshCerts(true);
-          toast(`证书探测完成：${result.refreshed || 0} 个成功，${result.errors || 0} 个失败。`, "success");
-          await reloadDetail();
-        } catch (error) {
-          toast(error.message || "证书探测失败", "danger");
-        } finally {
-          if (refreshBtn.isConnected) buttonBusy(refreshBtn, false);
-        }
-      },
-    });
-
-    const body = el("div", { class: "ecm-stack" });
-    const httpsField = switchField({
-      label: "启用 HTTPS",
-      hint: "由 Caddy 自动申请和续期证书；关闭后只通过 HTTP 提供服务。",
-      checked: form.https,
-      disabled: !editable,
-      onChange: (checked) => {
-        form.https = checked;
-        httpsHint.textContent = checked
-          ? "HTTPS 开启：Caddy 会自动申请证书。"
-          : "HTTPS 已关闭：不会为这些域名申请证书。";
+    const saved = detail;
+    const matchesFile = saved.formMatchesFile === true && !saved.drift && !saved.conflict;
+    const status = el("div", { class: "ecm-stack", "aria-live": "polite" });
+    const results = el("div", { class: "ecm-stack", "aria-live": "polite" });
+    const caArea = el("div", { class: "ecm-stack", "aria-live": "polite" });
+    const entry = accessFields(form.access, {
+      allowLegacy: !saved.model?.access,
+      addresses: () => form.domains,
+      onChange: () => {
+        updateStatus();
         updateDirty();
       },
     });
-    refs.https = httpsField;
-    const httpsHint = el(
-      "p",
-      { class: "ecm-hint" },
-      form.https ? "HTTPS 开启：Caddy 会自动申请证书。" : "HTTPS 已关闭：不会为这些域名申请证书。",
-    );
-    body.append(httpsField.root, httpsHint);
+    const address = selectField({
+      label: "检测入口",
+      options: (saved.urls || []).map((url, index) => ({ value: String(index + 1), label: url })),
+      value: "1",
+      onChange: () => results.replaceChildren(),
+    });
+    const check = button("检测本机入口", {
+      icon: "refresh-cw",
+      compact: true,
+      onClick: async () => {
+        buttonBusy(check, true, "检测中…");
+        address.control.disabled = true;
+        try {
+          const data = await api.siteEntryCheck(slug, Number(address.control.value));
+          const trust = { trusted: "宿主信任", untrusted: "宿主未信任", not_applicable: "仅 HTTP", unknown: "未确认" };
+          const issuance = { presented: "入口已出示证书", not_applicable: "仅 HTTP", unknown: "未确认" };
+          results.replaceChildren(metaGrid([
+            { label: "本机连接", value: data.connected ? "可连接" : "失败" },
+            { label: "证书签发", value: issuance[data.issuance] },
+            { label: "信任结果", value: trust[data.trust] },
+            { label: "HTTP 响应", value: data.httpStatus || "未验证" },
+            { label: "探测目标", value: data.target, mono: true },
+            { label: "检测时间", value: fmtDateTime(data.checkedAt, { seconds: true }) },
+            ...(data.certificate?.issuer ? [{ label: "签发者", value: data.certificate.issuer }] : []),
+            ...(data.certificate?.notAfter ? [{ label: "到期时间", value: fmtDateTime(data.certificate.notAfter) }] : []),
+          ]));
+          if (data.error) results.append(feedback(data.error, "warning"));
+        } catch (error) {
+          results.replaceChildren(feedback(error.message, "danger"));
+        } finally {
+          buttonBusy(check, false);
+          address.control.disabled = false;
+        }
+      },
+    });
+    const loadCa = button("读取运行实例的根 CA", {
+      icon: "download",
+      compact: true,
+      onClick: async () => {
+        buttonBusy(loadCa, true, "读取中…");
+        try {
+          const data = await api.siteRootCA(slug);
+          const download = button("下载根 CA（PEM）", {
+            icon: "download",
+            compact: true,
+            onClick: () => {
+              const objectUrl = URL.createObjectURL(new Blob([data.pem], { type: "application/x-pem-file" }));
+              el("a", { href: objectUrl, download: "caddy-local-root.crt" }).click();
+              setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+            },
+          });
+          caArea.replaceChildren(
+            el("p", { class: "ecm-hint" }, "请通过可信渠道核对 SHA-256 指纹，然后将根证书导入需要访问站点的客户端信任库。使用站点 URL 重新访问，确认浏览器信任证书。"),
+            metaGrid([{ label: "SHA-256 指纹", value: data.fingerprint, mono: true }]),
+            download,
+          );
+        } catch (error) {
+          caArea.replaceChildren(feedback(error.message, "danger"));
+        } finally {
+          buttonBusy(loadCa, false);
+        }
+      },
+    });
+    const entryCheck = el("div", { class: "ecm-stack" }, address.root, check, results);
+    const localCa = el("div", { class: "ecm-stack" }, loadCa, caArea);
+    const refreshLegacy = button("检测证书状态", {
+      icon: "refresh-cw",
+      compact: true,
+      onClick: async () => {
+        buttonBusy(refreshLegacy, true, "探测中…");
+        try {
+          const result = await api.refreshCerts(true);
+          if (detail === saved) saved.certs = result.items || [];
+        } catch (error) {
+          toast(error.message || "证书探测失败", "danger");
+        } finally {
+          buttonBusy(refreshLegacy, false);
+          if (refreshLegacy.isConnected) updateStatus();
+        }
+      },
+    });
+    const legacyCerts = el("div", { class: "ecm-stack" });
+    const legacy = el("div", { class: "ecm-stack" }, refreshLegacy, legacyCerts);
+    const card = section({
+      title: "访问协议与证书",
+      children: el("div", { class: "ecm-stack" }, entry.root, status, entryCheck, localCa, legacy),
+    });
 
-    const staging = Boolean(
-      globalInfo && globalInfo.form && (globalInfo.form.staging === true || globalInfo.form.staging === "true"),
-    );
-    if (staging) {
-      body.append(
-        feedback(
-          "全局配置正在使用 Let's Encrypt staging CA，签发的证书不会被浏览器信任；正式上线前请关闭 staging。",
-          "warning",
-        ),
-      );
+    card.id = "ecm-site-tls";
+    card.tabIndex = -1;
+
+    function updateStatus() {
+      const stable = saved.enabled && matchesFile &&
+        JSON.stringify(form.access) === JSON.stringify(accessDraft(saved.model?.access, saved.model?.https !== false, true)) &&
+        JSON.stringify(form.domains) === JSON.stringify(saved.domains);
+      const explicit = form.access.scope !== "legacy";
+      entryCheck.hidden = !(stable && explicit);
+      localCa.hidden = !(stable && explicit && form.access.protocol === "internal");
+      const domains = form.domains.filter(isDomain).map((domain) => domain.toLowerCase());
+      legacy.hidden = !(stable && !explicit && form.access.protocol === "auto" && domains.length);
+      status.replaceChildren();
+      if (form.access.protocol === "auto" && globalInfo?.form?.staging) {
+        status.append(feedback("全局配置启用了 Let’s Encrypt 测试环境。签发的证书需要测试环境信任。", "warning"));
+      }
+      if (explicit && !stable) {
+        status.append(el("p", { class: "ecm-hint" }, "保存、加载并启用入口后，可检测本机访问。"));
+      } else if (explicit) {
+        status.append(el("p", { class: "ecm-hint" }, "入口已保存。检测会从宿主连接监听地址，并使用宿主的证书信任库。"));
+      }
+      legacyCerts.replaceChildren();
+      if (legacy.hidden) return;
+      const rows = (saved.certs || []).filter((cert) => domains.includes(cert.domain));
+      if (!rows.length) return;
+      legacyCerts.append(dataTable({
+        label: "站点证书",
+        columns: [
+          { key: "domain", label: "域名", mono: true },
+          { key: "issuer", label: "签发者", hideBelow: "sm" },
+          { key: "not_after", label: "到期时间", render: (row) => row.not_after ? fmtDateTime(row.not_after) : "—" },
+          { key: "days", label: "剩余", align: "right", render: certBadge },
+          { key: "checked_at", label: "探测时间", hideBelow: "md",
+            render: (row) => row.checked_at ? fmtRelative(row.checked_at) : "未探测" },
+        ],
+        rows,
+      }));
     }
 
-    const certs = Array.isArray(detail.certs) ? detail.certs : [];
-    if (certs.length === 0) {
-      body.append(
-        emptyState({
-          title: "尚无证书记录",
-          body: detail.custom ? "自定义片段没有域名信息。" : "域名还没有 HTTPS 证书缓存，可手动刷新探测。",
-          icon: "shield",
-        }),
-      );
-    } else {
-      body.append(
-        dataTable({
-          label: "站点证书",
-          columns: [
-            { key: "domain", label: "域名", mono: true },
-            { key: "issuer", label: "签发者", hideBelow: "sm" },
-            {
-              key: "not_after",
-              label: "到期时间",
-              render: (row) => (row.not_after ? fmtDateTime(row.not_after) : "—"),
-            },
-            { key: "days", label: "剩余", align: "right", render: (row) => certBadge(row) },
-            {
-              key: "checked_at",
-              label: "探测时间",
-              hideBelow: "md",
-              render: (row) => (row.checked_at ? fmtRelative(row.checked_at) : "未探测"),
-            },
-          ],
-          rows: certs,
-          getRowAriaLabel: (row) => `证书 ${row.domain}`,
-        }),
-      );
-    }
+    Object.assign(refs, entry.fields);
+    refs.updateHttps = () => {
+      entry.update();
+      updateStatus();
+    };
+    updateStatus();
+    return card;
+  }
+
+  function buildTrafficSection() {
+    const draft = form.routing || routingDraft(null, form.proxy);
+    const paths = routingEditor(draft, {
+      active: form.routed,
+      toggle: (checked) => {
+        form.routed = checked;
+        if (checked) form.routing = draft;
+        renderPage();
+        updateDirty();
+        refs.routingFields?.routing.control.focus();
+      },
+      change: updateDirty,
+      policies: LB_OPTIONS,
+    });
+    refs.routingFields = paths.fields;
+    if (form.routed) return section({ title: "流量去向", children: paths.root });
+
+    const upstreamsField = textareaField({
+      label: "上游地址",
+      value: form.proxy.upstreams.join("\n"),
+      rows: 4,
+      mono: true,
+      hint: "每行一个上游，支持 host:port、http(s)://host:port、[v6]:port，最多 20 个。",
+      onInput: (value) => {
+        form.proxy.upstreams = parseLines(value);
+        refs.updateProxy?.();
+        updateDirty();
+      },
+    });
+    refs.upstreams = upstreamsField;
 
     return section({
-      title: "HTTPS 与证书",
-      actions: detail.custom ? null : refreshBtn,
-      children: body,
+      title: "流量去向",
+      children: el("div", { class: "ecm-stack" }, upstreamsField.root, paths.root, buildProxySection()),
     });
   }
 
   function buildProxySection() {
-    refs = refs || {};
+    const lbField = selectField({
+      label: "负载均衡策略",
+      options: LB_OPTIONS,
+      value: form.proxy.lbPolicy,
+      onChange: (value) => {
+        form.proxy.lbPolicy = value;
+        updateDirty();
+      },
+    });
+    refs.lbPolicy = lbField;
     const healthSwitch = switchField({
       label: "启用主动健康检查",
-      hint: "关闭时不会生成 health_* 指令。",
       checked: form.proxy.health.enabled,
       onChange: (checked) => {
         form.proxy.health.enabled = checked;
@@ -733,7 +870,7 @@ export async function mount(root, ctx, route) {
 
     const skipVerify = switchField({
       label: "跳过上游 TLS 校验",
-      hint: "仅对显式 https:// 上游生效；会生成 tls_insecure_skip_verify。",
+      hint: "跳过 HTTPS 上游的证书验证，仅对以 https:// 开头的上游有效。",
       checked: form.proxy.skipVerify,
       onChange: (checked) => {
         form.proxy.skipVerify = checked;
@@ -745,7 +882,7 @@ export async function mount(root, ctx, route) {
       value: form.proxy.hostHeader,
       mono: true,
       placeholder: "example.internal",
-      hint: "留空则不生成 header_up Host。",
+      hint: "留空时使用 Caddy 默认的 Host 头处理方式。",
       onInput: (value) => {
         form.proxy.hostHeader = value;
         updateDirty();
@@ -790,6 +927,7 @@ export async function mount(root, ctx, route) {
     const grid = el(
       "div",
       { class: "ecm-form-grid" },
+      lbField.root,
       healthSwitch.root,
       healthFields,
       advanced,
@@ -803,12 +941,15 @@ export async function mount(root, ctx, route) {
     refs.hostHeader = hostHeader;
     refs.dialTimeout = dialTimeout;
     refs.responseHeaderTimeout = responseTimeout;
+    refs.updateProxy = () => {
+      skipVerify.root.hidden = !form.proxy.upstreams.some((address) => address.startsWith("https://"));
+    };
+    refs.updateProxy();
 
-    return section({
-      title: "反向代理",
-      description: "健康检查、上游 TLS、Host 头与超时；WebSocket 由 Caddy 自动处理。",
-      children: grid,
-    });
+    return el("details", { class: "ecm-details" },
+      el("summary", null, "代理池设置"),
+      el("div", { class: "ecm-details-body" }, grid),
+    );
   }
 
   async function askCredentials({ title, user = "", requireUser = false, submitLabel = "生成哈希" }) {
@@ -824,7 +965,7 @@ export async function mount(root, ctx, route) {
         value: user,
         maxLength: 64,
         disabled: !requireUser,
-        hint: requireUser ? "字母、数字、点、下划线或连字符，1-64 个字符。" : "用户名保持不变。",
+        hint: requireUser ? "字母、数字、点、下划线或连字符，1–64 个字符。" : undefined,
       });
       const passwordField = inputField({
         label: requireUser ? "密码" : "新密码",
@@ -892,7 +1033,7 @@ export async function mount(root, ctx, route) {
         submit();
       });
       formEl.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" && event.target && event.target.tagName !== "TEXTAREA") {
+        if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
           event.preventDefault();
           submit();
         }
@@ -905,7 +1046,7 @@ export async function mount(root, ctx, route) {
     const body = el("div", { class: "ecm-stack" });
     const encodeField = switchField({
       label: "压缩响应",
-      hint: "生成 encode zstd gzip。",
+      hint: "启用 Zstandard 和 gzip 响应压缩。",
       checked: form.security.encode,
       onChange: (checked) => {
         form.security.encode = checked;
@@ -914,7 +1055,7 @@ export async function mount(root, ctx, route) {
     });
     const hstsField = switchField({
       label: "HSTS",
-      hint: "生成 Strict-Transport-Security（仅 HTTPS 站点有效）。",
+      hint: "让浏览器后续只用 HTTPS 访问本站，仅在 HTTPS 站点生效。",
       checked: form.security.hsts,
       onChange: (checked) => {
         form.security.hsts = checked;
@@ -932,18 +1073,9 @@ export async function mount(root, ctx, route) {
     body.append(toggles);
 
     const authBlock = el("div", { class: "ecm-subsection" });
-    authBlock.append(
-      el(
-        "div",
-        { class: "ecm-subsection-head" },
-        el(
-          "div",
-          null,
-          el("h3", { class: "ecm-subtitle" }, "Basic Auth 用户"),
-          el("p", { class: "ecm-hint" }, "密码在浏览器中只用于生成 bcrypt 哈希；保存的是哈希，不是明文。"),
-        ),
-      ),
-    );
+    authBlock.append(el("div", { class: "ecm-subsection-head" },
+      el("h3", { class: "ecm-subtitle" }, "Basic Auth 用户"),
+    ));
     const authList = el("div", { class: "ecm-rows" });
     const addAuthBtn = button("添加用户", {
       variant: "secondary",
@@ -1076,9 +1208,9 @@ export async function mount(root, ctx, route) {
         { class: "ecm-subsection-head" },
         el(
           "div",
-          null,
+          { class: "ecm-heading-with-help" },
           el("h3", { class: "ecm-subtitle" }, "自定义响应头"),
-          el("p", { class: "ecm-hint" }, "名称不区分大小写且不能重复；值不能包含换行。"),
+          helpTip("名称不区分大小写且不能重复，值不能包含换行。", "自定义响应头"),
         ),
       ),
     );
@@ -1150,26 +1282,13 @@ export async function mount(root, ctx, route) {
     body.append(headerBlock);
 
     return section({
-      title: "安全",
-      description: "仅静态站点与反向代理生效；重定向站点只保留域名、目标与状态码。",
+      title: "访问控制与响应设置",
       children: body,
     });
   }
 
   function buildLogsSection() {
     if (detail.orphan) return null;
-    if (detail.custom) {
-      return section({
-        title: "访问日志",
-        children: [
-          emptyState({
-            title: "自定义片段没有域名信息",
-            body: "无法按站点过滤访问日志。服务日志可在概览页的日志抽屉中查看。",
-            icon: "terminal",
-          }),
-        ],
-      });
-    }
     const viewer = logViewer({
       scope: "site",
       slug,
@@ -1179,7 +1298,7 @@ export async function mount(root, ctx, route) {
     logsViewer = viewer;
     const card = section({
       title: "访问日志",
-      description: "按站点域名过滤 journald 中的访问日志；仅当日志区域可见时每 1 秒轮询。",
+      help: "按本站域名筛选服务日志，只有日志区域可见时才自动刷新。",
       children: viewer.root,
     });
     viewer.start();
@@ -1206,25 +1325,21 @@ export async function mount(root, ctx, route) {
       value: detail.raw || "",
       baseline: detail.raw || "",
       maxBytes: 48 * 1024,
-      saveLabel: detail.custom ? "保存片段" : "保存原文",
-      saveVariant: detail.custom || detail.modelError ? "primary" : "secondary",
+      saveLabel: detail.enabled ? "保存并重载" : "保存",
+      saveInHeader: true,
       validateName: "片段",
       onValidate: (content) => api.validateSnippet(content),
       onFormat: (content) => api.fmt(content),
       onSave: (content, baseline, force) => api.saveRaw(slug, content, baseline, force),
       onConflictReload: () => reloadDetail(),
-      onBusyChange: (busy) => setFormControlsDisabled(busy),
-      onBeforeSave: async () => {
-        if (!formDirty()) return true;
-        return confirmDialog({
-          title: "丢弃未保存的表单修改？",
-          message: "保存原文会刷新页面，并丢弃表单中尚未保存的修改。",
-          confirmLabel: "保存原文",
-          danger: true,
-        });
+      onBusyChange: (busy) => {
+        saving = busy;
+        setSavingUi(busy, { raw: true });
       },
-      onSaved: async () => {
-        toast("片段已保存并应用。", "success");
+      onSaved: async (result) => {
+        mode = "raw";
+        rememberEditorMode(modeKey, "raw");
+        toast(result?.apply?.message || "片段已保存。", "success");
         await reloadDetail();
       },
       onDirtyChange: (value) => {
@@ -1236,7 +1351,7 @@ export async function mount(root, ctx, route) {
     children.push(editor.root);
     return section({
       title: detail.custom ? "片段原文" : "配置文件（原文）",
-      description: "直接编辑生成的 Caddyfile 片段；保存前会单独校验片段并整体校验主配置。",
+      help: "保存前会校验此片段和主配置。",
       children,
     });
   }
@@ -1254,7 +1369,8 @@ export async function mount(root, ctx, route) {
     if (detail.conflict) {
       items.push({ label: "冲突", value: "启用与停用目录同时存在片段", tone: "danger" });
     }
-    return section({ title: "站点信息", children: metaGrid(items) });
+    return el("details", { class: "ecm-details" },
+      el("summary", null, "站点信息"), el("div", { class: "ecm-details-body" }, metaGrid(items)));
   }
 
   async function viewBackup(item) {
@@ -1291,10 +1407,10 @@ export async function mount(root, ctx, route) {
 
   function buildBackupsAside() {
     const backups = Array.isArray(detail.backups) ? detail.backups : [];
-    const card = section({ title: "备份", description: "最近 10 份站点片段备份。", children: [] });
+    const card = section({ title: "备份", help: "保存或变更站点状态时自动备份，最多保留 10 份。", children: [] });
     const body = card.querySelector(".ecm-card-body");
     if (backups.length === 0) {
-      body.append(el("p", { class: "ecm-hint" }, "暂无备份；创建、保存、启用或停用时会自动备份当前文件。"));
+      body.append(el("p", { class: "ecm-hint" }, "暂无备份"));
       return card;
     }
     const list = el("div", { class: "ecm-backup-list" });
@@ -1321,6 +1437,7 @@ export async function mount(root, ctx, route) {
         }),
         button("恢复", {
           variant: "ghost",
+          className: "ecm-file-action",
           icon: "rotate-ccw",
           compact: true,
           onClick: () => restoreBackup(item),
@@ -1334,7 +1451,7 @@ export async function mount(root, ctx, route) {
   }
 
   async function restoreBackup(item) {
-    if (!(await confirmDiscard())) return;
+    if (saving || !(await confirmDiscard())) return;
     const ok = await confirmDialog({
       title: "恢复备份",
       message: [
@@ -1345,6 +1462,8 @@ export async function mount(root, ctx, route) {
       danger: true,
     });
     if (!ok) return;
+    saving = true;
+    setSavingUi(true);
     toast("正在恢复备份…", "info");
     try {
       const result = await api.restoreBackup(item.name);
@@ -1355,78 +1474,26 @@ export async function mount(root, ctx, route) {
     } catch (error) {
       showTopError(error);
       toast(error.message || "恢复备份失败", "danger");
+    } finally {
+      saving = false;
+      setSavingUi(false);
     }
   }
 
   async function adoptDisk() {
-    if (!detail.raw) return;
+    if (saving || !detail.raw) return;
     if (!(await confirmDiscard())) return;
+    saving = true;
+    setSavingUi(true);
     toast("正在应用磁盘内容…", "info");
     try {
-      const result = await api.saveRaw(slug, detail.raw, detail.raw, true);
+      const result = await api.saveRaw(slug, detail.raw, detail.raw, false);
+      mode = "raw";
+      rememberEditorMode(modeKey, "raw");
       const message = result && result.apply && result.apply.message ? result.apply.message : "已采用磁盘内容。";
       toast(message, "success");
       await reloadDetail();
     } catch (error) {
-      showTopError(error);
-    }
-  }
-
-  async function saveForm(opts = {}) {
-    if (saving || !form) return;
-    let force = Boolean(opts.force);
-    if (detail.drift && !opts.skipDriftConfirm && !force) {
-      const ok = await confirmDialog({
-        title: "覆盖磁盘上的修改？",
-        message:
-          "磁盘上的片段已被外部修改。用表单保存会按当前表单重新生成片段并覆盖这些修改；如需保留磁盘内容，请选择「以磁盘为准」。",
-        confirmLabel: "覆盖并保存",
-        danger: true,
-      });
-      if (!ok) return;
-      force = true;
-    }
-    if (rawDirty && !opts.skipRawConfirm) {
-      const ok = await confirmDialog({
-        title: "丢弃原文编辑？",
-        message: "原文编辑器中有未保存的修改，保存表单会覆盖并丢弃这些修改。",
-        confirmLabel: "继续保存",
-        danger: true,
-      });
-      if (!ok) return;
-    }
-    saving = true;
-    setSavingUi(true);
-    try {
-      const model = buildFormModel();
-      let result;
-      try {
-        result = await api.updateSite(slug, model, detail.raw, force);
-      } catch (error) {
-        if (!(error && error.code === "conflict") || force) throw error;
-        const choice = await conflictDialog({
-          title: "检测到外部修改",
-          message: error.message || "磁盘内容已与基线上不同。",
-          details: error.details,
-        });
-        if (choice === "disk") {
-          await reloadDetail();
-          toast("已载入磁盘内容，本地表单修改已丢弃。", "info");
-          return;
-        }
-        if (choice !== "overwrite") return;
-        result = await api.updateSite(slug, model, detail.raw, true);
-      }
-      dirty = false;
-      const message =
-        result && result.apply && result.apply.message ? result.apply.message : "站点已保存。";
-      toast(message, "success");
-      await reloadDetail();
-    } catch (error) {
-      setFormControlsDisabled(false);
-      if (error && error.details && typeof error.details.field === "string") {
-        highlightField(error.details.field, error.message);
-      }
       showTopError(error);
     } finally {
       saving = false;
@@ -1434,16 +1501,52 @@ export async function mount(root, ctx, route) {
     }
   }
 
-  function setSavingUi(next) {
-    if (ui.saveBtn) {
-      if (next) buttonBusy(ui.saveBtn, true, "保存中…");
-      else buttonBusy(ui.saveBtn, false);
+  async function saveForm() {
+    if (saving || mode === "raw") return;
+    saving = true;
+    setSavingUi(true);
+    try {
+      if (typeof detail.raw !== "string") throw new Error("无法读取当前文件，请重新读取后再保存。");
+      const model = buildFormModel();
+      const result = await saveReviewedForm({
+        baseline: detail.raw,
+        review: reviewForm || detail.formMatchesFile !== true || detail.drift,
+        preview: () => api.previewSite(slug, model),
+        save: (baseline) => api.updateSite(slug, model, baseline, false),
+        reload: reloadDetail,
+        confirmLabel: detail.enabled ? "保存并重载" : "保存",
+      });
+      if (!result) return;
+      rememberEditorMode(modeKey, "form");
+      reviewForm = false;
+      initialSnapshot = JSON.stringify(form);
+      updateDirty();
+      const loadStatus = result?.apply?.reloaded ? "运行实例已加载" : "等待运行实例加载";
+      toast(model.access ? `已保存。${loadStatus}。可在站点详情检测本机入口。` : (result?.apply?.message || "站点已保存。"), "success");
+      await reloadDetail();
+    } catch (error) {
+      setFormControlsDisabled(false);
+      if (typeof error?.details?.field === "string") highlightField(error.details.field, error.message);
+      showTopError(error);
+    } finally {
+      saving = false;
+      setSavingUi(false);
+    }
+  }
+
+  function setSavingUi(next, { raw = false } = {}) {
+    if (!raw) {
+      if (ui.saveBtn) buttonBusy(ui.saveBtn, next, "保存中…");
+      rawEditorInstance?.setDisabled(next);
     }
     if (ui.toggleBtn) ui.toggleBtn.disabled = next;
     if (ui.deleteBtn) ui.deleteBtn.disabled = next;
     if (ui.refreshBtn) ui.refreshBtn.disabled = next;
-    if (rawEditorInstance) rawEditorInstance.setDisabled(next);
+    for (const control of page.querySelectorAll(".ecm-config-toolbar button, .ecm-file-action")) {
+      control.disabled = next;
+    }
     setFormControlsDisabled(next);
+    refs.updateHttps?.();
   }
 
   async function toggleEnabled() {
@@ -1564,34 +1667,17 @@ export async function mount(root, ctx, route) {
       const actions = [
         button("以磁盘为准", {
           variant: "secondary",
+          className: "ecm-file-action",
           icon: "download",
           compact: true,
           onClick: () => adoptDisk(),
         }),
       ];
-      if (!detail.custom && !detail.modelError) {
-        actions.push(
-          button("用表单覆盖", {
-            variant: "secondary",
-            icon: "upload",
-            compact: true,
-            onClick: async () => {
-              const ok = await confirmDialog({
-                title: "用表单覆盖磁盘内容",
-                message: "将按当前表单重新生成片段并覆盖磁盘上的外部修改。",
-                confirmLabel: "覆盖并保存",
-                danger: true,
-              });
-              if (ok) saveForm({ force: true, skipDriftConfirm: true });
-            },
-          }),
-        );
-      }
       nodes.push(
         banner({
           tone: "warning",
           title: "磁盘上的片段已被外部修改",
-          message: "当前文件内容与插件上次写入的基线不同。请选择以磁盘为准，或用表单/原文覆盖。",
+          message: "当前文件与上次保存的版本不同。保存表单时会先显示差异。",
           actions,
         }),
       );
@@ -1623,6 +1709,31 @@ export async function mount(root, ctx, route) {
     refs = {};
     const canEditForm =
       !detail.custom && !detail.orphan && !detail.modelError && ["static", "proxy", "redirect"].includes(detail.type);
+    const raw = !canEditForm || mode === "raw";
+    const configPanel = el("div", { class: "ecm-stack" });
+    const viewRaw = () => viewConfiguration("站点配置文件", detail.raw);
+    if (!detail.orphan) {
+      configPanel.append(configurationToolbar({
+        raw, canEditForm, view: viewRaw,
+        switchMode: async () => {
+          if (saving || !(await confirmDiscard())) return;
+          mode = raw ? "form" : "raw";
+          if (raw) reviewForm = true;
+          initForm();
+          renderPage();
+          page.querySelector(".ecm-config-toolbar button")?.focus();
+        },
+      }));
+      if (raw) {
+        configPanel.append(buildRawSection());
+      } else {
+        configPanel.append(buildBasicSection(), buildHttpsSection());
+        if (detail.type === "proxy") configPanel.append(buildTrafficSection());
+        if (detail.type === "static" || detail.type === "proxy") configPanel.append(buildSecuritySection());
+        configPanel.append(buildNotesSection());
+      }
+    }
+    configPanel.append(buildSummaryAside());
 
     const refreshBtn = button("", {
       variant: "ghost",
@@ -1631,21 +1742,25 @@ export async function mount(root, ctx, route) {
       ariaLabel: "重新读取站点",
       title: "重新读取",
       onClick: async () => {
-        if (!(await confirmDiscard())) return;
-        await reloadDetail();
+        if (saving || !(await confirmDiscard())) return;
+        saving = true;
+        setSavingUi(true);
+        try {
+          await reloadDetail();
+        } finally {
+          saving = false;
+          setSavingUi(false);
+        }
       },
     });
     ui.refreshBtn = refreshBtn;
 
-    let saveBtn = null;
-    if (canEditForm) {
-      saveBtn = button("保存并重载", {
-        variant: "primary",
-        icon: "save",
-        onClick: () => saveForm(),
-      });
-      ui.saveBtn = saveBtn;
-    }
+    const saveBtn = raw ? rawEditorInstance?.saveButton : button(detail.enabled ? "保存并重载" : "保存", {
+      variant: "primary",
+      icon: "save",
+      onClick: saveForm,
+    });
+    ui.saveBtn = saveBtn;
 
     let toggleBtn = null;
     if (!detail.orphan) {
@@ -1674,6 +1789,7 @@ export async function mount(root, ctx, route) {
     ui.deleteBtn = deleteBtn;
 
     const actions = [refreshBtn];
+    if (!detail.orphan) actions.push(linkButton("检查站点", `#/diagnostics?site=${encodeURIComponent(slug)}`, { icon: "activity" }));
     if (saveBtn) actions.push(saveBtn);
     if (toggleBtn) actions.push(toggleBtn);
     actions.push(deleteBtn);
@@ -1691,13 +1807,29 @@ export async function mount(root, ctx, route) {
     if (detail.drift) badges.push(badge("外部修改", "warning"));
     if (detail.modelError) badges.push(badge("模型异常", "warning"));
 
-    const domains = Array.isArray(detail.domains) ? detail.domains : [];
-    const subtitle = el(
-      "span",
-      { class: "ecm-detail-sub" },
-      domains.length > 0 ? chips(domains, { mono: true, limit: 6 }) : null,
-      el("span", { class: "ecm-hint ecm-mono" }, `${detail.slug} · ${typeLabel(detail.type)}`),
+    const useFile = detail.formMatchesFile !== true || detail.drift || detail.conflict;
+    const fileRoute = useFile && !detail.conflict && detail.type === "proxy" ? proxyRouteFromFile(detail.raw) : null;
+    const entries = useFile ? (fileRoute ? [fileRoute.entry] : []) : detail.urls?.length ? detail.urls : detail.domains;
+    const targets = useFile ? fileRoute?.upstreams : detail.type === "proxy" && !form.routed ? form.proxy.upstreams
+      : detail.type === "redirect" ? [form.redirect.target] : null;
+    const subtitle = el("span", { class: "ecm-detail-sub" },
+      el("span", { class: "ecm-hint" }, typeLabel(detail.type)),
+      entries.length ? el("span", { class: "ecm-route", role: "group", "aria-label": "站点入口与目标" },
+        !useFile && detail.enabled && detail.urls?.length
+          ? entries.slice(0, 6).map((url) => el("a", { class: "ecm-link ecm-chip ecm-mono", href: url, target: "_blank", rel: "noopener noreferrer" }, url))
+          : chips(entries, { mono: true, limit: 6 }),
+        targets?.length ? [icon("arrow-right", 16), chips(targets, { mono: true, limit: 3 })] : null,
+      ) : null,
+      useFile && fileRoute ? el("span", { class: "ecm-hint" },
+        fileRoute.entry.startsWith("http://0.0.0.0:") ? "磁盘文件 · 监听所有 IPv4 网卡" : "磁盘文件",
+      ) : null,
+      useFile && !fileRoute && !detail.orphan ? button("查看磁盘文件", {
+        variant: "ghost", className: "ecm-file-action", compact: true, onClick: viewRaw,
+      }) : null,
     );
+    if (detail.formMatchesFile === false) {
+      badges.push(badge("表单与文件有差异", "warning", { title: "用表单保存前会显示将覆盖的差异。" }));
+    }
 
     const header = pageHeader({
       title: displayName(),
@@ -1708,63 +1840,44 @@ export async function mount(root, ctx, route) {
       badges,
     });
     dirtyIndicator = el("span", { class: "ecm-dirty", hidden: true }, "未保存");
-    const titleRow = header.querySelector(".ecm-page-title-row");
-    if (titleRow) titleRow.append(dirtyIndicator);
+    header.querySelector(".ecm-page-title-row").append(dirtyIndicator);
 
     topMessages = el("div", { class: "ecm-messages" });
+    const logPanel = el("div", { class: "ecm-stack" });
+    const backupPanel = buildBackupsAside();
+    const items = [
+      { id: "config", label: "配置", panel: configPanel },
+      ...(!detail.orphan ? [{ id: "logs", label: "访问日志", panel: logPanel }] : []),
+      { id: "backups", label: "备份", panel: backupPanel },
+    ];
+    if (!items.some((item) => item.id === activeTab)) activeTab = "config";
+    const navigation = tabs({
+      items, value: activeTab, label: "站点详情",
+      onChange: (id) => {
+        activeTab = id;
+        for (const item of items) item.panel.hidden = item.id !== id;
+        if (saveBtn) saveBtn.hidden = id !== "config";
+        if (id === "logs" && !logPanel.hasChildNodes()) logPanel.append(buildLogsSection());
+      },
+    });
 
-    const mainCol = el("div", { class: "ecm-detail-main ecm-stack" });
-    const aside = el("aside", { class: "ecm-detail-aside ecm-stack" });
-
-    if (detail.custom) {
-      mainCol.append(
-        section({
-          title: "自定义片段",
-          children: [
-            feedback(
-              "该文件由手工创建，没有插件元数据。可用操作：编辑原文、启用/停用、删除。",
-              "info",
-            ),
-            metaGrid([
-              { label: "文件", value: detail.path || "—", mono: true },
-              { label: "大小", value: detail.size ? fmtBytes(detail.size) : "—" },
-              { label: "修改时间", value: detail.mtime ? fmtDateTime(detail.mtime, { seconds: true }) : "—" },
-            ]),
-          ],
-        }),
-      );
-    } else if (!detail.orphan) {
-      if (canEditForm) {
-        mainCol.append(buildBasicSection());
-        mainCol.append(buildHttpsSection());
-        if (detail.type === "proxy") mainCol.append(buildProxySection());
-        if (detail.type === "static" || detail.type === "proxy") {
-          mainCol.append(buildSecuritySection());
-        }
-      } else {
-        mainCol.append(buildHttpsSection());
-      }
-    }
-
-    const logsSection = buildLogsSection();
-    if (logsSection) mainCol.append(logsSection);
-    const rawSection = buildRawSection();
-    if (rawSection) mainCol.append(rawSection);
-
-    aside.append(buildSummaryAside());
-    aside.append(buildBackupsAside());
-
-    const layout = el("div", { class: "ecm-detail-layout" }, mainCol, aside);
-    const content = el("div", { class: "ecm-stack" });
-    content.append(topMessages);
-    for (const node of buildBanners()) content.append(node);
-    content.append(layout);
+    const content = el("div", { class: "ecm-stack" }, topMessages, buildBanners());
+    content.append(navigation.root, ...items.map((item) => item.panel));
 
     page.replaceChildren(header, content);
     updateDirty();
   }
 
   await load();
+  if (route.section === "tls") {
+    requestAnimationFrame(() => {
+      const target = page.querySelector("#ecm-site-tls");
+      if (target?.isConnected) {
+        target.focus({ preventScroll: true });
+        target.scrollIntoView({ block: "start" });
+      }
+    });
+  }
 
   return {
     async beforeLeave() {

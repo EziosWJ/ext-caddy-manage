@@ -5,7 +5,7 @@
 #   sudo ./deploy/install.sh --host-user godesk
 #
 # 脚本只负责系统层准备：Caddy 二进制、caddy 账号、目录、初始 Caddyfile、
-# systemd unit 与 sudoers 规则。它不会启动 Caddy，也不会安装插件本身。
+# systemd unit。sudoers 由系统管理员配置。脚本不会启动 Caddy 或安装插件。
 # 可重复执行；已存在的 Caddyfile 永远不会被覆盖。
 
 set -euo pipefail
@@ -14,7 +14,6 @@ CADDY_VERSION="2.10.2"
 TARBALL=""
 HOST_USER="godesk"
 HOST_GROUP=""
-INSTALL_SUDOERS=1
 ALLOW_UNVERIFIED=0
 
 CADDY_ROOT="/opt/caddy"
@@ -25,7 +24,6 @@ SNIPPET_DIR="/opt/caddy/config/conf.d"
 DISABLED_DIR="/opt/caddy/config/conf.d.disabled"
 SITES_ROOT="/opt/caddy/sites"
 UNIT_TARGET="/etc/systemd/system/caddy.service"
-SUDOERS_TARGET="/etc/sudoers.d/ext-caddy-manage"
 
 usage() {
   cat <<'EOF'
@@ -36,7 +34,6 @@ usage() {
   --tarball <文件>        使用本地 Caddy 发布包（caddy_<版本>_linux_<架构>.tar.gz）
   --host-user <账号>      运行 Extension Host 的账号（默认 godesk）
   --host-group <组>       上述账号的组（默认取该账号的主组）
-  --no-sudoers            不安装 /etc/sudoers.d/ext-caddy-manage
   --allow-unverified      允许安装无法校验的本地 tarball 或下载包（不推荐）
   -h, --help              显示本帮助
 
@@ -72,10 +69,6 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--host-group 需要参数"
       HOST_GROUP="$2"
       shift 2
-      ;;
-    --no-sudoers)
-      INSTALL_SUDOERS=0
-      shift
       ;;
     --allow-unverified)
       ALLOW_UNVERIFIED=1
@@ -258,36 +251,6 @@ if [[ $UNIT_CHANGED -eq 1 ]]; then
   fi
 fi
 
-# ---------------------------------------------------------------- sudoers
-if [[ $INSTALL_SUDOERS -eq 1 ]]; then
-  if [[ ! -d /etc/sudoers.d ]]; then
-    warn "未找到 /etc/sudoers.d，跳过 sudoers 规则"
-  elif ! command -v visudo >/dev/null 2>&1; then
-    warn "未找到 visudo，跳过 sudoers 规则；请手动安装 deploy/sudoers.example"
-  else
-    {
-      printf '%s\n' \
-        '# 由 ext-caddy-manage install.sh 生成；仅允许宿主账号提权执行 caddy.service 的 start/stop/restart。' \
-        '# 重新运行 install.sh 会按 --host-user 更新本文件。' \
-        '' \
-        'Cmnd_Alias CADDY_SERVICE = \' \
-        '  /usr/bin/systemctl start --no-ask-password -- caddy.service, \' \
-        '  /usr/bin/systemctl stop --no-ask-password -- caddy.service, \' \
-        '  /usr/bin/systemctl restart --no-ask-password -- caddy.service'
-      printf '%s ALL=(root) NOPASSWD: CADDY_SERVICE\n' "$HOST_USER"
-    } > "$TMP/sudoers"
-    visudo -cf "$TMP/sudoers" >/dev/null 2>&1 || die "生成的 sudoers 规则未通过 visudo 校验"
-    if [[ -f "$SUDOERS_TARGET" ]] && cmp -s "$TMP/sudoers" "$SUDOERS_TARGET"; then
-      say "sudoers 规则已是最新：$SUDOERS_TARGET"
-    else
-      say "写入 sudoers 规则：$SUDOERS_TARGET"
-      install -o root -g root -m 0440 "$TMP/sudoers" "$SUDOERS_TARGET"
-    fi
-  fi
-else
-  say "按 --no-sudoers 跳过 sudoers 规则"
-fi
-
 # ---------------------------------------------------------------- 后续步骤
 cat <<EOF
 
@@ -301,16 +264,7 @@ cat <<EOF
 2. 让宿主账号读取 journald 日志（重新登录或重启宿主进程后生效）：
      sudo usermod -aG systemd-journal $HOST_USER
 
-3. 配置服务授权：把 deploy/grants.example.json 合并到宿主使用的授权文件，
-   并通过 --service-grants <文件>（独立宿主）或 --extension-grants <文件>（GoDesk）
-   传给宿主后重启宿主：
-     {
-       "cn.ezios.ecm": {
-         "units": ["caddy.service"],
-         "actions": ["list", "get", "start", "stop", "restart", "logs"],
-         "elevate": ["start", "stop", "restart"]
-       }
-     }
+3. 非 root 宿主的启停和重启权限由系统管理员配置，参见 deploy/README.md 的 sudoers 小节。
 
 4. 安装并启用本插件（在项目根目录）：
      ext pkg
@@ -324,10 +278,7 @@ cat <<EOF
      serviceUnit   caddy.service
 
 6. 打开插件「诊断」页确认：二进制、Caddyfile、目录、systemd 单元、
-   服务授权、journald 日志、整体校验均为正常。首次使用可点「生成初始配置」。
-
-验证提权规则（会真正启动服务，请确认后执行）：
-     sudo -n -k -u root -- /usr/bin/systemctl start --no-ask-password -- caddy.service
+   journald 日志、整体校验均为正常。首次使用可点「生成初始配置」。
 
 更多说明见 deploy/README.md。
 EOF

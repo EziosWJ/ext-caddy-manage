@@ -89,6 +89,24 @@ local function run(args, stdin, timeoutMs)
   }
 end
 
+-- Only fixed, local Admin endpoints are eligible for read-only projections.
+function M.localAdminEndpoint(address)
+  if type(address) ~= "string" then return nil end
+  address = address:match("^(%S+)%s+#.*$") or address:match("^(%S+)%s+{$") or address
+  local socket = address:match("^unix/(//?[%w._/-]+)$")
+  if socket then return "http://localhost", { "--unix-socket", socket } end
+  local name, port = address:match("^([^%s]*):(%d+)$")
+  if not port or tonumber(port) < 1 or tonumber(port) > 65535 then return nil end
+  if name == "" then name = "127.0.0.1" end
+  local args = {}
+  if name == "localhost" then
+    args = { "--resolve", "localhost:" .. port .. ":127.0.0.1,[::1]" }
+  elseif name ~= "127.0.0.1" and name ~= "[::1]" then
+    return nil
+  end
+  return "http://" .. name .. ":" .. port, args
+end
+
 function M.version()
   local result, err = run({ "version" }, nil, 5000)
   if not result then
@@ -125,14 +143,14 @@ function M.validateSnippet(text)
   return { ok = true }
 end
 
-function M.validateMain(path)
+function M.validateMain(path, timeoutMs)
   if type(path) ~= "string" or path == "" then
     return {
       ok = false,
       error = { code = "bad_request", message = "主配置文件路径无效", details = { field = "mainConfig" } },
     }
   end
-  local result, err = run({ "validate", "--config", path, "--adapter", "caddyfile" }, nil, 15000)
+  local result, err = run({ "validate", "--config", path, "--adapter", "caddyfile" }, nil, timeoutMs or 15000)
   if not result then return { ok = false, error = err } end
   return { ok = true }
 end

@@ -7,6 +7,7 @@ import {
   emptyState,
   errorBlock,
   feedback,
+  helpTip,
   icon,
   linkButton,
   loadingBlock,
@@ -26,10 +27,20 @@ import {
   fmtCpuTime,
   fmtDateTime,
   fmtDays,
+  fmtDurationMs,
   fmtRelative,
   statusLabel,
   statusTone,
 } from "../format.js";
+
+const SNAPSHOT_STATUS = {
+  uncollected: ["未采集", "neutral"],
+  ok: ["已采集", "success"],
+  expired: ["已过期", "warning"],
+  unreachable: ["不可达", "danger"],
+  unavailable: ["不可用", "warning"],
+  truncated: ["已截断", "warning"],
+};
 
 function bootStateLabel(value) {
   switch (value) {
@@ -75,7 +86,6 @@ export async function mount(root, ctx) {
 
   const header = pageHeader({
     title: "概览",
-    subtitle: "Caddy 服务状态、站点规模、证书与最近错误。",
     actions: [refreshBtn, logBtn],
   });
   const content = el("div", { class: "ecm-stack" });
@@ -85,6 +95,103 @@ export async function mount(root, ctx) {
   let destroyed = false;
   let drawer = null;
   let drawerViewer = null;
+  let snapshotTimer = null;
+  const snapshotStatus = el("span", { "aria-live": "polite" });
+  const snapshotBody = el("div", { class: "ecm-stack" });
+  const collectBtn = button("采集运行快照", {
+    compact: true, icon: "refresh-cw", onClick: () => loadSnapshot(true),
+  });
+  const snapshotCard = section({
+    title: "Caddy 运行快照", actions: [snapshotStatus, collectBtn], children: snapshotBody,
+  });
+
+  function renderSnapshot(snapshot) {
+    const [label, tone] = SNAPSHOT_STATUS[snapshot.status] || SNAPSHOT_STATUS.unavailable;
+    snapshotStatus.replaceChildren(badge(label, tone, { dot: true }));
+    const period = snapshot.periodSeconds ? `每 ${snapshot.periodSeconds} 秒采集`
+      : snapshot.scheduleUnavailable ? "周期采集不可用" : "周期采集已关闭";
+    const timestamp = snapshot.checkedAt ? `更新于 ${fmtDateTime(snapshot.checkedAt, { seconds: true })} · ` : "";
+    snapshotBody.replaceChildren(el("p", { class: "ecm-hint" }, timestamp + period));
+    if (snapshot.status === "expired") {
+      snapshotBody.append(feedback("这份快照已过期。请重新采集以确认当前状态。", "warning"));
+    }
+    if (snapshot.message) snapshotBody.append(feedback(snapshot.message, "warning"));
+    if (snapshot.status === "uncollected") {
+      snapshotBody.append(el("p", { class: "ecm-hint" }, "按「采集运行快照」读取本机 Caddy Metrics。"));
+    }
+    if (snapshot.runtime && Object.keys(snapshot.runtime).length) {
+      const runtime = snapshot.runtime;
+      snapshotBody.append(metaGrid([
+        { label: "Caddy RSS", value: fmtBytes(runtime.rssBytes) },
+        { label: "Go 堆已分配", value: fmtBytes(runtime.heapBytes) },
+        { label: "Goroutine", value: runtime.goroutines },
+        { label: "进程 CPU 时间", value: runtime.cpuSeconds == null ? "—" : `${runtime.cpuSeconds.toFixed(2)} 秒` },
+        { label: "进程启动", value: runtime.startedAt ? fmtDateTime(runtime.startedAt * 1000, { seconds: true }) : "—" },
+      ]));
+    }
+    if (!snapshot.handlers) return;
+    snapshotBody.append(
+      el("h3", null, "HTTP 处理器"),
+      el("p", { class: "ecm-hint" }, "按 Caddy server 与 handler 汇总累计样本。同一请求可能经过多个处理器。平均耗时和 HTTP 5xx 来自响应耗时样本，中间件错误来自单独的计数器。"),
+    );
+    if (snapshot.handlers.length) {
+      snapshotBody.append(dataTable({
+        label: "HTTP 处理器指标",
+        columns: [
+          { key: "server", label: "Server", mono: true },
+          { key: "handler", label: "处理器", mono: true },
+          { key: "requests", label: "处理次数", align: "right" },
+          { key: "meanMs", label: "平均耗时", render: (row) => fmtDurationMs(row.meanMs) },
+          { key: "http5xx", label: "HTTP 5xx", align: "right" },
+          { key: "errors", label: "中间件错误", align: "right" },
+        ],
+        rows: snapshot.handlers,
+      }));
+    } else {
+      snapshotBody.append(el("p", { class: "ecm-hint" }, "暂无 HTTP 处理器样本。可在全局配置中确认已启用 metrics，并访问站点后重新采集。"));
+    }
+    snapshotBody.append(
+      el("h3", null, "上游状态"),
+      el("p", { class: "ecm-hint" }, "Caddy 报告可选的上游仍需单独确认连通。"),
+    );
+    if (!snapshot.upstreams.length) {
+      snapshotBody.append(el("p", { class: "ecm-hint" }, "没有上游健康样本。可在站点诊断中检查上游连通。"));
+    }
+    for (const upstream of snapshot.upstreams) {
+      const unhealthy = upstream.status === "unhealthy";
+      snapshotBody.append(el("div", { class: "ecm-inline ecm-wrap" },
+        el("code", { class: "ecm-mono" }, upstream.address),
+        badge(unhealthy ? "Caddy 报告不健康" : "Caddy 可选 · 连通未验证", unhealthy ? "warning" : "neutral"),
+      ));
+    }
+  }
+
+  let snapshotLoading = false;
+  async function loadSnapshot(refresh = false) {
+    if (snapshotLoading || destroyed) return;
+    snapshotLoading = true;
+    clearTimeout(snapshotTimer);
+    if (refresh) buttonBusy(collectBtn, true, "采集中…");
+    try {
+      const snapshot = await api.metrics(refresh);
+      if (destroyed) return;
+      renderSnapshot(snapshot);
+      if (snapshot.periodSeconds) {
+        snapshotTimer = setTimeout(() => loadSnapshot(), 15000);
+      } else if (snapshot.expiresIn > 0) {
+        snapshotTimer = setTimeout(() => loadSnapshot(), (snapshot.expiresIn + 1) * 1000);
+      }
+    } catch (error) {
+      if (!destroyed) renderSnapshot({ status: "unavailable", message: error.message });
+    } finally {
+      snapshotLoading = false;
+      if (refresh) {
+        buttonBusy(collectBtn, false);
+        if (!destroyed && document.activeElement === document.body) collectBtn.focus();
+      }
+    }
+  }
+
 
   function openLogDrawer() {
     if (drawer) {
@@ -157,11 +264,13 @@ export async function mount(root, ctx) {
     const svc = service || {};
     const available = svc.available !== false && !svc.error;
     const running = Boolean(svc.running);
+    const unitDetails = [svc.fragmentPath, svc.stateDetail].filter(Boolean).join("\n");
     const card = section({
       title: "服务状态",
       actions: [
         badge(statusLabel(svc.state), statusTone(svc.state), { dot: true }),
         el("span", { class: "ecm-chip ecm-mono" }, svc.unit || "caddy.service"),
+        unitDetails ? helpTip(unitDetails, "服务单元") : null,
       ],
       children: [],
     });
@@ -188,14 +297,9 @@ export async function mount(root, ctx) {
         { label: "内存占用", value: fmtBytes(svc.memoryBytes) },
         { label: "CPU 时间", value: fmtCpuTime(svc.cpuUsageNs) },
         { label: "开机启动", value: bootStateLabel(svc.bootState) },
-        { label: "服务单元", value: svc.unit || "—", mono: true },
-        { label: "单元文件", value: svc.fragmentPath || "—", mono: true, title: svc.fragmentPath || "" },
       ]),
     );
 
-    if (svc.stateDetail) {
-      body.append(el("p", { class: "ecm-service-detail" }, svc.stateDetail));
-    }
     if (svc.error && svc.error.code) {
       body.append(el("p", { class: "ecm-hint" }, `错误码：${svc.error.code}`));
     }
@@ -225,7 +329,12 @@ export async function mount(root, ctx) {
       title: "校验主配置并让 Caddy 重载",
       onClick: () => runServiceAction("reload", reloadBtn),
     });
-    body.append(el("div", { class: "ecm-toolbar ecm-service-actions" }, startBtn, stopBtn, restartBtn, reloadBtn));
+    body.append(el(
+      "div",
+      { class: "ecm-toolbar ecm-service-actions" },
+      el("div", { class: "ecm-service-action-group", role: "group", "aria-label": "启动与重载" }, startBtn, reloadBtn),
+      el("div", { class: "ecm-service-action-group", role: "group", "aria-label": "会中断服务的操作" }, restartBtn, stopBtn),
+    ));
     return card;
   }
 
@@ -256,7 +365,7 @@ export async function mount(root, ctx) {
 
     const card = section({
       title: "证书",
-      description: "只显示启用 HTTPS 的站点域名；探测结果反映实际服务中的证书。",
+      help: "显示启用 HTTPS 的站点实际提供的证书。",
       actions,
       children: [],
       flush: true,
@@ -266,7 +375,6 @@ export async function mount(root, ctx) {
       body.append(
         emptyState({
           title: "暂无 HTTPS 域名",
-          body: "为站点启用 HTTPS 后，这里会显示证书签发者与到期时间。",
           icon: "shield",
         }),
       );
@@ -313,7 +421,8 @@ export async function mount(root, ctx) {
       : [];
     const card = section({
       title: "最近错误",
-      description: "保留最近 10 条服务、配置应用与日志读取错误，最新在前。",
+      help: "最多显示最近 10 条服务、配置应用和日志读取错误。",
+      flush: true,
       children: [],
     });
     const body = card.querySelector(".ecm-card-body");
@@ -321,7 +430,6 @@ export async function mount(root, ctx) {
       body.append(
         emptyState({
           title: "暂无最近错误",
-          body: "一旦出现配置校验、重载或服务操作错误，会在这里记录。",
           icon: "check-circle",
         }),
       );
@@ -344,7 +452,7 @@ export async function mount(root, ctx) {
       entry.append(text);
       list.append(entry);
     }
-    body.append(list);
+    body.append(el("div", { class: "ecm-card-pad" }, list));
     return card;
   }
 
@@ -353,7 +461,7 @@ export async function mount(root, ctx) {
     content.replaceChildren();
 
 
-    content.append(renderService(data.service));
+    content.append(renderService(data.service), snapshotCard);
 
     const sites = data.sites || {};
     const tiles = el("div", { class: "ecm-tiles" });
@@ -381,6 +489,7 @@ export async function mount(root, ctx) {
       if (destroyed) return;
       data = result || {};
       render();
+      loadSnapshot();
     } catch (error) {
       if (destroyed) return;
       content.replaceChildren(
@@ -399,6 +508,7 @@ export async function mount(root, ctx) {
   return {
     destroy() {
       destroyed = true;
+      clearTimeout(snapshotTimer);
       if (drawerViewer) {
         drawerViewer.destroy();
         drawerViewer = null;

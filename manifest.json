@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "cn.ezios.ecm",
   "name": "Caddy 管理",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "minHostVersion": "0.3.0",
   "hostApi": {
     "min": 1,
@@ -12,10 +12,6 @@
     "web": "web/index.html",
     "lua": "lua/init.lua"
   },
-  "capabilities": [
-    "storage",
-    "services"
-  ],
   "config": {
     "caddyBinary": {
       "type": "string",
@@ -50,6 +46,10 @@
       "default": 6,
       "min": 1,
       "max": 168
+    },
+    "metricsPeriodic": {
+      "type": "boolean",
+      "default": false
     },
     "backupKeep": {
       "type": "number",

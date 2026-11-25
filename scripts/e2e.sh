@@ -13,7 +13,7 @@
 #   CADDY_VERSION 下载的 Caddy 版本（默认 2.10.2）
 #   CADDY_TARBALL 本地 Caddy 发布包 caddy_<版本>_linux_<架构>.tar.gz
 #   CADDY_BIN     直接使用已有 caddy 二进制（优先于下载）
-#   E2E_SYSTEMD=1 额外检查真实 caddy.service（需要 systemd、grants 与 sudoers）
+#   E2E_SYSTEMD=1 额外读取 caddy.service 状态（需要 systemd 与已安装的 unit）
 #   E2E_KEEP=1    保留临时目录与日志
 #
 # 注意：初始化步骤会短暂使用 Caddy 默认的 Admin 端口 2019；同一台机器上不要
@@ -240,7 +240,7 @@ import socket
 
 sockets = []
 ports = []
-for _ in range(4):
+for _ in range(5):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     sockets.append(sock)
@@ -248,14 +248,14 @@ for _ in range(4):
 print(" ".join(ports))
 PY
 )
-read -r ADMIN_PORT HTTP_PORT HTTPS_PORT HOST_PORT <<< "$PORT_LINE" || fail "无法分配空闲端口"
-for port in "$ADMIN_PORT" "$HTTP_PORT" "$HTTPS_PORT" "$HOST_PORT"; do
+read -r ADMIN_PORT HTTP_PORT HTTPS_PORT HOST_PORT PROXY_PORT <<< "$PORT_LINE" || fail "无法分配空闲端口"
+for port in "$ADMIN_PORT" "$HTTP_PORT" "$HTTPS_PORT" "$HOST_PORT" "$PROXY_PORT"; do
   [[ "$port" =~ ^[0-9]+$ ]] || fail "无法分配空闲端口"
 done
-say "端口：admin=$ADMIN_PORT http=$HTTP_PORT https=$HTTPS_PORT host=$HOST_PORT"
+say "端口：admin=$ADMIN_PORT http=$HTTP_PORT https=$HTTPS_PORT host=$HOST_PORT proxy=$PROXY_PORT"
 
 # 初始化会用默认 admin 127.0.0.1:2019 写一次骨架并尝试 reload。
-# - 若 2019 已被真实服务监听，立即中止，避免重配置现有 Caddy。
+# - 若 2019 已被真实服务监听，使用预置配置，避免调用现有 Caddy。
 # - 若端口空闲或连接挂起，初始化期间临时占用它并运行只应答 200 的 Admin 桩。
 #   这样既不会误连后来启动的真实服务，也能让初始化确定完成；随后立即关闭。
 PORT_2019_MODE=$(python3 - <<'PY'
@@ -286,7 +286,7 @@ PY
 )
 case "$PORT_2019_MODE" in
   busy)
-    fail "端口 2019 已被占用（可能是本机 Caddy 的 Admin API）。为避免影响现有服务，请先停止它再运行 e2e。"
+    skip "端口 2019 已被占用。在隔离 Caddyfile 中预置测试端口，跳过默认初始化。"
     ;;
   refused)
     say "端口 2019 空闲，初始化时将临时占用它作为 Admin 桩，避免与后来启动的服务竞争"
@@ -361,8 +361,9 @@ say "Caddy：$("$CADDY" version | awk 'NR==1{print $1}')"
 API_BASE="http://127.0.0.1:$HOST_PORT/extensions/cn.ezios.ecm/api"
 HOST_BASE="http://127.0.0.1:$HOST_PORT"
 
-say "启动 Extension Host 与插件（ext run）"
-"$WORK/bin/ext" run "$PKG" --listen "127.0.0.1:$HOST_PORT" --data-dir "$WORK/host-data" \
+say "打包并启动 Extension Host 与插件（ext run）"
+"$WORK/bin/ext" pack "$PKG" -o "$WORK/plugin.zip" || fail "插件打包失败"
+"$WORK/bin/ext" run "$WORK/plugin.zip" --listen "127.0.0.1:$HOST_PORT" --data-dir "$WORK/host-data" \
   >"$WORK/logs/host.log" 2>&1 &
 HOST_PID=$!
 
@@ -407,7 +408,17 @@ assert_eq "health.snippetDir" data.snippetDir "$SNIPPET_DIR"
 assert_eq "health.sitesRoot" data.sitesRoot "$SITES_ROOT"
 
 say "初始化目录与主 Caddyfile"
-if [[ "$PORT_2019_MODE" != "busy" ]]; then
+if [[ "$PORT_2019_MODE" == "busy" ]]; then
+  mkdir -p "$SNIPPET_DIR" "$DISABLED_DIR" "$SITES_ROOT"
+  cat > "$MAIN_CONFIG" <<EOF
+# >>> ext-caddy-manage:global
+{
+  admin 127.0.0.1:$ADMIN_PORT
+}
+# <<< ext-caddy-manage:global
+import conf.d/*.caddy
+EOF
+else
   cat > "$WORK/admin2019.py" <<'PY'
 import http.server
 import socketserver
@@ -447,12 +458,12 @@ PY
   if ! kill -0 "$DUMMY_PID" 2>/dev/null; then
     fail "临时 Admin 桩已退出（端口 2019 可能被其他进程抢占）"
   fi
+  printf '{}\n' > "$WORK/body.json"
+  http_call POST /diagnostics/init "$WORK/body.json"
+  assert_status 200 "初始化失败"
+  assert_ok "初始化未返回 ok"
+  assert_eq "init.written" data.written true
 fi
-printf '{}\n' > "$WORK/body.json"
-http_call POST /diagnostics/init "$WORK/body.json"
-assert_status 200 "初始化失败"
-assert_ok "初始化未返回 ok"
-assert_eq "init.written" data.written true
 [[ -f "$MAIN_CONFIG" ]] || fail "初始化后主 Caddyfile 不存在"
 grep -Fq -- '# >>> ext-caddy-manage:global' "$MAIN_CONFIG" || fail "主 Caddyfile 缺少受管标记"
 
@@ -505,12 +516,41 @@ grep -Fq -- "http_port $HTTP_PORT" "$MAIN_CONFIG" || fail "主 Caddyfile 缺少 
 grep -Fq -- "https_port $HTTPS_PORT" "$MAIN_CONFIG" || fail "主 Caddyfile 缺少 https_port"
 grep -Fq -- 'import conf.d/*.caddy' "$MAIN_CONFIG" || fail "主 Caddyfile 缺少 import"
 
+say "预览全局表单，不写入主 Caddyfile"
+cp "$MAIN_CONFIG" "$WORK/main-before-preview.caddy"
+http_call GET /global
+assert_status 200 "读取全局表单失败"
+python3 - "$RESP" "$WORK/body.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response:
+    detail = json.load(response)["data"]
+form = dict(detail["form"], baseline=detail["raw"], email="e2e@example.com")
+with open(sys.argv[2], "w", encoding="utf-8") as body:
+    json.dump(form, body)
+PY
+http_call POST /global/preview "$WORK/body.json"
+assert_status 200 "预览全局表单失败"
+assert_ok "全局表单预览未返回 ok"
+j get "$RESP" data.content > "$WORK/main-preview.caddy"
+grep -Fq -- 'email e2e@example.com' "$WORK/main-preview.caddy" || fail "全局预览未生成邮箱"
+grep -Fq -- 'import conf.d/*.caddy' "$WORK/main-preview.caddy" || fail "全局预览遗漏块外内容"
+cmp -s "$MAIN_CONFIG" "$WORK/main-before-preview.caddy" || fail "预览不应修改主 Caddyfile"
+
 say "启动 Caddy（非 systemd，Admin API 127.0.0.1:$ADMIN_PORT）"
 "$CADDY" run --config "$MAIN_CONFIG" --adapter caddyfile >"$WORK/logs/caddy.log" 2>&1 &
 CADDY_PID=$!
 if ! wait_http "http://127.0.0.1:$ADMIN_PORT/config/" 30; then
   fail "Caddy Admin API 未就绪"
 fi
+
+say "保存全局表单并核对预览"
+http_call POST /global "$WORK/body.json"
+assert_status 200 "保存全局表单失败"
+assert_ok "全局表单保存未返回 ok"
+assert_eq "全局表单已重载" data.apply.reloaded true
+cmp -s "$MAIN_CONFIG" "$WORK/main-preview.caddy" || fail "全局预览与实际写入不一致"
 
 # ---------------------------------------------------------------- 新建站点
 
@@ -616,6 +656,83 @@ done
 [[ "$HTTP_BODY" == *"e2e-static-ok"* ]] || fail "HTTP 请求未命中站点（响应：$HTTP_BODY）"
 say "HTTP 响应正确"
 
+# ---------------------------------------------------------------- 本机反代
+
+say "创建本机反代并验证回环监听、请求转发和地址冲突"
+python3 - "$WORK/body.json" "$PROXY_PORT" "$HTTP_PORT" <<'PY'
+import json
+import sys
+
+path, proxy_port, upstream_port = sys.argv[1:]
+model = {
+    "name": "E2E loopback proxy",
+    "type": "proxy",
+    "domains": [f"127.0.0.1:0{proxy_port}", f"localhost:{proxy_port}"],
+    "https": True,
+    "proxy": {"upstreams": [f"127.0.0.1:{upstream_port}"], "hostHeader": "e2e.local"},
+}
+with open(path, "w", encoding="utf-8") as body:
+    json.dump({"model": model}, body)
+PY
+http_call POST /site "$WORK/body.json"
+assert_status 200 "创建本机反代失败"
+assert_eq "本机反代已重载" data.apply.reloaded true
+assert_eq "本机端口规范化" data.model.domains.0 "127.0.0.1:$PROXY_PORT"
+assert_eq "本机反代没有证书" data.certs '[]'
+PROXY_SLUG=$(j get "$RESP" data.slug)
+j get "$RESP" data.raw > "$WORK/proxy.raw"
+grep -Fq -- "http://127.0.0.1:$PROXY_PORT, http://localhost:$PROXY_PORT {" "$WORK/proxy.raw" \
+  || fail "本机反代缺少 HTTP 地址"
+grep -Fxq -- $'\tbind 127.0.0.1' "$WORK/proxy.raw" || fail "本机反代未绑定到回环地址"
+for host in "127.0.0.1" "localhost"; do
+  HTTP_BODY=$(curl --noproxy '*' -fsS --max-time 3 -H "Host: $host:$PROXY_PORT" \
+    "http://127.0.0.1:$PROXY_PORT/") || fail "请求本机反代失败：$host"
+  [[ "$HTTP_BODY" == *"e2e-static-ok"* ]] || fail "本机反代响应不正确：$host"
+done
+
+http_call POST /site "$WORK/body.json"
+assert_status 409 "重复的本机站点地址应冲突"
+assert_error "本机站点地址冲突错误码" conflict
+
+say "通过表单改为监听所有 IPv4 网卡"
+http_call GET "/site?slug=$PROXY_SLUG"
+assert_status 200 "读取本机反代失败"
+python3 - "$RESP" "$WORK/body.json" "$PROXY_PORT" <<'PY'
+import json
+import sys
+
+response, path, proxy_port = sys.argv[1:]
+with open(response, encoding="utf-8") as source:
+    site = json.load(source)["data"]
+site["model"]["domains"] = [f"0.0.0.0:0{proxy_port}"]
+with open(path, "w", encoding="utf-8") as body:
+    json.dump({"slug": site["slug"], "baseline": site["raw"], "model": site["model"]}, body)
+PY
+http_call POST /site/update "$WORK/body.json"
+assert_status 200 "保存 IPv4 通配监听失败"
+assert_eq "IPv4 通配端口规范化" data.model.domains.0 "0.0.0.0:$PROXY_PORT"
+assert_eq "IPv4 通配监听没有证书" data.certs '[]'
+assert_eq "IPv4 通配监听已重载" data.apply.reloaded true
+j get "$RESP" data.raw > "$WORK/proxy.raw"
+grep -Fxq -- "http://:$PROXY_PORT {" "$WORK/proxy.raw" || fail "IPv4 通配监听限制了 Host"
+grep -Fxq -- $'\tbind 0.0.0.0' "$WORK/proxy.raw" || fail "未监听所有 IPv4 网卡"
+HTTP_BODY=$(curl --noproxy '*' -fsS --max-time 3 -H "Host: 192.0.2.10:$PROXY_PORT" \
+  "http://127.0.0.1:$PROXY_PORT/") || fail "IPv4 通配监听未接受局域网 Host"
+[[ "$HTTP_BODY" == *"e2e-static-ok"* ]] || fail "IPv4 通配监听响应不正确"
+grep -Fq -- "\"logger\":\"http.log.access.ecm-ipv4-$PROXY_PORT\"" "$WORK/logs/caddy.log" \
+  || fail "IPv4 通配监听的访问日志缺少监听端口标识"
+
+python3 - "$WORK/body.json" "$PROXY_SLUG" "$WORK/proxy.raw" <<'PY'
+import json
+import sys
+
+path, slug, raw = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as body, open(raw, encoding="utf-8") as baseline:
+    json.dump({"slug": slug, "baseline": baseline.read()}, body)
+PY
+http_call POST /site/delete "$WORK/body.json"
+assert_status 200 "清理本机反代失败"
+
 # ---------------------------------------------------------------- 表单修改
 
 say "表单修改（改名、目录浏览、关闭 SPA、添加响应头）"
@@ -642,13 +759,20 @@ json.dump({
     "baseline": open(os.environ["BASELINE_FILE"], encoding="utf-8").read(),
 }, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False)
 PY
+http_call POST /site/preview "$WORK/body.json"
+assert_status 200 "预览站点表单失败"
+assert_ok "站点表单预览未返回 ok"
+j get "$RESP" data.content > "$WORK/snippet-preview.raw"
+cmp -s "$WORK/baseline.txt" "$SNIPPET_DIR/$SLUG.caddy" || fail "预览不应修改站点片段"
 http_call POST /site/update "$WORK/body.json"
 assert_status 200 "表单保存失败"
 assert_ok "表单保存未返回 ok"
 assert_eq "表单保存名称" data.model.name "E2E Static v2"
 assert_eq "表单保存 browse" data.model.static.browse true
 assert_eq "表单保存已重载" data.apply.reloaded true
+assert_eq "表单与磁盘内容一致" data.formMatchesFile true
 j get "$RESP" data.raw > "$WORK/snippet-v2.raw"
+cmp -s "$WORK/snippet-preview.raw" "$WORK/snippet-v2.raw" || fail "预览与表单保存的内容不一致"
 grep -Fq -- $'\tfile_server browse' "$WORK/snippet-v2.raw" || fail "browse 未生成"
 grep -Fq -- '"X-E2E" "yes"' "$WORK/snippet-v2.raw" || fail "自定义响应头未生成"
 if grep -Fq -- 'try_files' "$WORK/snippet-v2.raw"; then
@@ -677,6 +801,7 @@ assert_status 200 "原文保存失败"
 assert_ok "原文保存未返回 ok"
 assert_eq "原文保存已重载" data.apply.reloaded true
 assert_eq "原文保存 drift" data.drift false
+assert_eq "原文与表单生成结果不同" data.formMatchesFile false
 j get "$RESP" data.raw > "$WORK/snippet-v3.raw"
 cmp -s "$WORK/raw-with-marker.raw" "$WORK/snippet-v3.raw" || fail "原文保存内容不一致"
 grep -Fq -- '# e2e-raw-marker' "$SNIPPET_DIR/$SLUG.caddy" || fail "磁盘片段缺少原文标记"
@@ -858,27 +983,16 @@ grep -Fq -- $'\tlog' "$WORK/formatted.txt" || fail "格式化结果缺少缩进"
 
 SYSTEMD_CHECKED=0
 if [[ "$E2E_SYSTEMD" == 1 ]]; then
-  say "E2E_SYSTEMD=1：检查真实 systemd 集成（以 grants 重启宿主）"
+  say "E2E_SYSTEMD=1：读取 systemd 服务状态"
   if systemctl cat caddy.service >/dev/null 2>&1; then
-    if [[ -n ${HOST_PID:-} ]]; then
-      kill "$HOST_PID" 2>/dev/null
-      wait "$HOST_PID" 2>/dev/null || true
-      HOST_PID=""
-    fi
-    "$WORK/bin/ext" serve --listen "127.0.0.1:$HOST_PORT" --data-dir "$WORK/host-data" \
-      --service-grants "$ROOT/deploy/grants.example.json" >>"$WORK/logs/host.log" 2>&1 &
-    HOST_PID=$!
-    if ! wait_http "$API_BASE/health" 90; then
-      fail "带 grants 重启宿主后插件 API 未就绪"
-    fi
     http_call GET /service
     assert_status 200 "读取服务状态失败"
     if [[ "$(j get "$RESP" data.available)" == "true" ]]; then
       assert_eq "service.unit" data.unit "caddy.service"
       SYSTEMD_CHECKED=1
-      say "systemd 服务读取正常（start/stop/restart 仍需按 sudoers 手工验收）"
+      say "systemd 服务读取正常"
     else
-      skip "caddy.service 不可用：需要运行中的 systemd 与 grants"
+      skip "caddy.service 不可用：检查 systemd 与宿主账号的读取权限"
     fi
   else
     skip "未安装 caddy.service"

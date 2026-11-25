@@ -499,28 +499,79 @@ function toneIcon(tone) {
   }
 }
 
+let activeHelp;
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !activeHelp?.isConnected) return;
+  event.preventDefault();
+  event.stopPropagation();
+  activeHelp.hidden = true;
+  activeHelp = null;
+}, true);
+
+export function helpTip(message, label) {
+  const tip = el("span", { class: "ecm-help-tip", id: uid("help"), role: "tooltip", hidden: true }, message);
+  const trigger = el(
+    "button",
+    {
+      class: "ecm-help-trigger",
+      type: "button",
+      "aria-label": label ? `${label}说明` : "说明",
+      "aria-describedby": tip.id,
+    },
+    icon("help-circle", 16),
+  );
+  const root = el("span", { class: "ecm-help" }, trigger, tip);
+  function show() {
+    if (activeHelp && activeHelp !== tip) activeHelp.hidden = true;
+    activeHelp = tip;
+    tip.hidden = false;
+    tip.style.removeProperty("--ecm-tip-shift");
+    root.classList.remove("ecm-help-above");
+    const bounds = tip.getBoundingClientRect();
+    const viewport = document.documentElement;
+    const shift = Math.max(8 - bounds.left, 0) - Math.max(bounds.right - viewport.clientWidth + 8, 0);
+    tip.style.setProperty("--ecm-tip-shift", `${shift}px`);
+    const dialogBody = root.closest(".ecm-dialog-body")?.getBoundingClientRect();
+    const top = Math.max(0, dialogBody?.top ?? 0);
+    const bottom = Math.min(viewport.clientHeight, dialogBody?.bottom ?? viewport.clientHeight);
+    if (bounds.bottom > bottom && root.getBoundingClientRect().top - bounds.height >= top) {
+      root.classList.add("ecm-help-above");
+    }
+  }
+  function hide() {
+    tip.hidden = true;
+    if (activeHelp === tip) activeHelp = null;
+  }
+  root.addEventListener("pointerenter", show);
+  root.addEventListener("pointerleave", () => {
+    if (document.activeElement !== trigger) hide();
+  });
+  trigger.addEventListener("focus", show);
+  trigger.addEventListener("click", show);
+  trigger.addEventListener("blur", () => {
+    if (!root.matches(":hover")) hide();
+  });
+  return root;
+}
+
 function makeField(control, opts = {}) {
   const { label, hint, error, required = false, id, className } = opts;
   const controlId = id || control.id || uid("field");
   control.id = controlId;
   const root = el("div", { class: `ecm-field${className ? ` ${className}` : ""}` });
-  if (label) {
-    root.append(
-      el(
-        "label",
-        { class: "ecm-label", for: controlId },
-        label,
-        required ? el("span", { class: "ecm-req", "aria-hidden": "true" }, " *") : null,
-      ),
-    );
-  }
-  root.append(control);
+  const heading = el("div", { class: "ecm-field-heading", hidden: true });
+  if (label) heading.append(
+    el(
+      "label",
+      { class: "ecm-label", for: controlId },
+      label,
+      required ? el("span", { class: "ecm-req", "aria-hidden": "true" }, " *") : null,
+    ),
+  );
+  root.append(heading, control);
   const described = [];
-  if (hint) {
-    const hintId = uid("hint");
-    root.append(el("p", { class: "ecm-hint", id: hintId }, hint));
-    described.push(hintId);
-  }
+  let help = null;
   let errorEl = null;
   const syncDescribed = () => {
     if (described.length > 0) control.setAttribute("aria-describedby", described.join(" "));
@@ -550,17 +601,22 @@ function makeField(control, opts = {}) {
       syncDescribed();
     },
     setHint(message) {
-      let hintNode = root.querySelector(".ecm-hint");
-      if (!hintNode) {
-        hintNode = el("p", { class: "ecm-hint" });
-        root.append(hintNode);
+      if (help) {
+        described.splice(described.indexOf(help.lastElementChild.id), 1);
+        help.remove();
+        help = null;
       }
-      hintNode.textContent = message || "";
-      hintNode.hidden = !message;
+      if (message) {
+        help = helpTip(message, label);
+        heading.append(help);
+        described.push(help.lastElementChild.id);
+      }
+      heading.hidden = !label && !help;
+      syncDescribed();
     },
   };
+  fieldApi.setHint(hint);
   if (error) fieldApi.setError(error);
-  syncDescribed();
   return fieldApi;
 }
 
@@ -708,7 +764,7 @@ export function checkboxField(opts = {}) {
       el("span", { class: "ecm-check-label" }, label || ""),
     ),
   );
-  if (hint) root.append(el("p", { class: "ecm-hint ecm-hint-indent" }, hint));
+  addChoiceHelp(root, input, hint, label);
   let errorEl = null;
   const fieldApi = {
     root,
@@ -762,7 +818,7 @@ export function switchField(opts = {}) {
       el("span", { class: "ecm-switch-label" }, label || ""),
     ),
   );
-  if (hint) root.append(el("p", { class: "ecm-hint ecm-hint-indent" }, hint));
+  addChoiceHelp(root, input, hint, label);
   let errorEl = null;
   const fieldApi = {
     root,
@@ -785,6 +841,13 @@ export function switchField(opts = {}) {
   };
   if (error) fieldApi.setError(error);
   return fieldApi;
+}
+
+function addChoiceHelp(root, input, hint, label) {
+  if (!hint) return;
+  const help = helpTip(hint, label);
+  input.setAttribute("aria-describedby", help.lastElementChild.id);
+  root.prepend(el("div", { class: "ecm-field-heading" }, root.firstElementChild, help));
 }
 
 export function feedback(message, tone = "info", opts = {}) {
@@ -892,7 +955,7 @@ export function toast(message, tone = "info", opts = {}) {
 }
 
 export function section(opts = {}) {
-  const { title, description, actions, children, flush = false, id, className } = opts;
+  const { title, help, actions, children, flush = false, id, className } = opts;
   const card = el("section", {
     class: `ecm-card${className ? ` ${className}` : ""}`,
     id,
@@ -903,7 +966,7 @@ export function section(opts = {}) {
       "div",
       { class: "ecm-card-heading" },
       title ? el("h2", { class: "ecm-card-title" }, title) : null,
-      description ? el("p", { class: "ecm-card-desc" }, description) : null,
+      help ? helpTip(help, title) : null,
     );
     card.append(
       el("div", { class: "ecm-card-head" }, heading, actions ? el("div", { class: "ecm-card-actions" }, actions) : null),
@@ -1008,6 +1071,12 @@ export function tabs(opts = {}) {
       item.icon ? icon(item.icon, 16) : null,
       el("span", null, item.label),
     );
+    if (item.panel) {
+      if (!item.panel.id) item.panel.id = uid("tabpanel");
+      btn.setAttribute("aria-controls", item.panel.id);
+      item.panel.setAttribute("role", "tabpanel");
+      item.panel.setAttribute("aria-labelledby", btn.id);
+    }
     btn.addEventListener("click", () => select(item.id));
     btn.addEventListener("keydown", (event) => {
       const ids = items.map((entry) => entry.id);
@@ -1237,6 +1306,7 @@ export function confirmDialog(opts = {}) {
     cancelLabel = "取消",
     danger = false,
     details,
+    wide = false,
   } = opts;
   return new Promise((resolve) => {
     let settled = false;
@@ -1258,6 +1328,7 @@ export function confirmDialog(opts = {}) {
       title,
       body,
       actions: [cancelBtn, confirmBtn],
+      wide,
       initialFocus: () => cancelBtn,
       onClose: () => finish(false),
     });
@@ -1276,7 +1347,7 @@ export function confirmDialog(opts = {}) {
  * Resolve a save conflict: "disk" reloads the server copy, "overwrite" retries
  * with force, "cancel" leaves the editor as-is. Cancel receives initial focus.
  */
-export function conflictDialog({ title = "检测到外部修改", message, details } = {}) {
+export function conflictDialog({ title = "检测到外部修改", message, details, overwriteLabel = "强制覆盖" } = {}) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value) => {
@@ -1301,7 +1372,7 @@ export function conflictDialog({ title = "检测到外部修改", message, detai
     }
     const cancelBtn = button("取消", { variant: "secondary" });
     const diskBtn = button("以磁盘为准", { variant: "secondary", icon: "download" });
-    const overwriteBtn = button("强制覆盖", { variant: "danger", icon: "upload" });
+    const overwriteBtn = button(overwriteLabel, { variant: "danger", icon: "upload" });
     const handle = openDialog({
       title,
       body,
@@ -1324,7 +1395,7 @@ export function conflictDialog({ title = "检测到外部修改", message, detai
   });
 }
 
-function diffView(oldText, newText) {
+export function diffView(oldText, newText) {
   const lines = diffLines(oldText, newText);
   const stats = diffStats(lines);
   const root = el("div", { class: "ecm-diff-window" });
@@ -1394,6 +1465,7 @@ export function rawEditor(opts = {}) {
     disabledReason = "",
     saveLabel = "保存原文",
     saveVariant = "primary",
+    saveInHeader = false,
     placeholder = "",
     validateName = "片段",
     onValidate,
@@ -1449,7 +1521,7 @@ export function rawEditor(opts = {}) {
   const saveBtn = button(saveLabel, {
     variant: saveVariant,
     icon: "save",
-    compact: true,
+    compact: !saveInHeader,
     disabled: disabledState,
     onClick: () => save(false),
   });
@@ -1458,7 +1530,7 @@ export function rawEditor(opts = {}) {
     "div",
     { class: "ecm-editor-toolbar" },
     el("div", { class: "ecm-editor-tools" }, validateBtn, fmtBtn, diffBtn),
-    el("div", { class: "ecm-editor-actions" }, counter, saveBtn),
+    el("div", { class: "ecm-editor-actions" }, counter, saveInHeader ? null : saveBtn),
   );
 
   const root = el("div", { class: "ecm-raw-editor" });
@@ -1519,9 +1591,11 @@ export function rawEditor(opts = {}) {
   async function format() {
     if (!onFormat || busy || disabledState) return;
     clearStatus();
+    const before = current;
     buttonBusy(fmtBtn, true, "格式化中…");
     try {
-      const data = await onFormat(current);
+      const data = await onFormat(before);
+      if (current !== before || busy || disabledState) return;
       if (data && typeof data.formatted === "string" && data.formatted !== current) {
         current = data.formatted;
         textarea.value = current;
@@ -1535,7 +1609,7 @@ export function rawEditor(opts = {}) {
       showStatus(feedback(error.message || "格式化失败", "danger", { details: error.details }));
     } finally {
       buttonBusy(fmtBtn, false);
-      fmtBtn.disabled = disabledState || !onFormat;
+      fmtBtn.disabled = disabledState || busy || !onFormat;
     }
   }
 
@@ -1554,7 +1628,24 @@ export function rawEditor(opts = {}) {
     const sent = current;
     setBusy(true);
     try {
-      const response = await onSave(sent, base, Boolean(force));
+      let response;
+      try {
+        response = await onSave(sent, base, Boolean(force));
+      } catch (error) {
+        if (error?.code !== "conflict" || force) throw error;
+        const choice = await conflictDialog({
+          title: "检测到外部修改",
+          message: error.message || "磁盘上的内容已与基线不同。",
+          details: error.details,
+        });
+        if (choice === "disk") {
+          if (onConflictReload) await onConflictReload();
+          else showStatus(feedback("请刷新页面以载入磁盘内容。", "warning"));
+          return;
+        }
+        if (choice !== "overwrite") return;
+        response = await onSave(sent, base, true);
+      }
       base = sent;
       refreshDirty();
       const message =
@@ -1562,46 +1653,8 @@ export function rawEditor(opts = {}) {
           ? response.apply.message
           : "已保存。";
       showStatus(feedback(message, "success"));
-      if (onSaved) onSaved(response, sent);
+      if (onSaved) await onSaved(response, sent);
     } catch (error) {
-      if (error && error.code === "conflict") {
-        setBusy(false);
-        const choice = await conflictDialog({
-          title: "检测到外部修改",
-          message: error.message || "磁盘上的内容已与基线不同。",
-          details: error.details,
-        });
-        if (choice === "disk") {
-          if (onConflictReload) {
-            await onConflictReload();
-          } else {
-            showStatus(feedback("请刷新页面以载入磁盘内容。", "warning"));
-          }
-          return;
-        }
-        if (choice !== "overwrite") {
-          showStatus(feedback("已取消保存。", "warning"));
-          return;
-        }
-        try {
-          setBusy(true);
-          const retrySent = current;
-          const response = await onSave(retrySent, base, true);
-          base = retrySent;
-          refreshDirty();
-          const message =
-            response && response.apply && response.apply.message
-              ? response.apply.message
-              : "已强制保存。";
-          showStatus(feedback(message, "success"));
-          if (onSaved) onSaved(response, retrySent);
-        } catch (retryError) {
-          showStatus(feedback(retryError.message || "保存失败", "danger", { details: retryError.details }));
-        } finally {
-          setBusy(false);
-        }
-        return;
-      }
       showStatus(feedback(error.message || "保存失败", "danger", { details: error.details }));
     } finally {
       setBusy(false);
@@ -1625,6 +1678,7 @@ export function rawEditor(opts = {}) {
 
   return {
     root,
+    saveButton: saveBtn,
     getValue: () => current,
     setValue(next) {
       current = String(next || "");
@@ -1710,7 +1764,7 @@ export function logViewer(opts = {}) {
     clearTimeout(state.filterTimer);
     state.filterTimer = setTimeout(() => {
       state.q = qInput.value.trim();
-      refreshNow();
+      refreshNow(true);
     }, 300);
   });
 
@@ -1740,6 +1794,7 @@ export function logViewer(opts = {}) {
       "aria-label": "状态码过滤",
     });
     statusSelect.append(el("option", { value: "" }, "全部状态"));
+    statusSelect.append(el("option", { value: "4xx" }, "全部 4xx"), el("option", { value: "5xx" }, "全部 5xx"));
     for (const code of [101, 200, 201, 204, 206, 301, 302, 304, 307, 308, 400, 401, 403, 404, 405, 408, 409, 429, 500, 502, 503, 504]) {
       statusSelect.append(el("option", { value: String(code) }, String(code)));
     }
@@ -1786,12 +1841,12 @@ export function logViewer(opts = {}) {
   linesSelect.addEventListener("change", () => {
     state.lines = Number(linesSelect.value);
     updateExportLink();
-    refreshNow();
+    refreshNow(true);
   });
   if (statusSelect) {
     statusSelect.addEventListener("change", () => {
       state.status = statusSelect.value;
-      refreshNow();
+      refreshNow(true);
     });
   }
 
@@ -1818,7 +1873,58 @@ export function logViewer(opts = {}) {
     statusEl,
   );
 
-  const root = el("div", { class: "ecm-log" }, controls, output);
+  const summary = scope === "site" ? el("div", { class: "ecm-stack" }, el("h3", null, "近期访问摘要")) : null;
+  const root = el("div", { class: "ecm-log" }, summary, controls, output);
+
+  let lastSummary;
+  function renderSummary(data) {
+    if (!summary || !data) return;
+    const serialized = JSON.stringify(data);
+    if (lastSummary === serialized) return;
+    lastSummary = serialized;
+    const focusedClass = summary.contains(document.activeElement) && document.activeElement.dataset.logStatus;
+
+    const coverage = {
+      window: "已读取当前可见 Journal 窗口。",
+      line_limit: "达到所选行数上限。增大行数可查看更早的记录。",
+      truncated: "达到 64 KiB 读取上限，仅统计最新的完整日志行。",
+      empty: "当前 Journal 窗口为空。访问站点后重试，并确认日志输出到 Journal。",
+      restricted: "Journal 读取权限不足。可见记录可能不完整，请检查宿主账号的读取权限。",
+      unavailable: "Journal 不可用。请检查 journalctl、服务单元及宿主权限。",
+      unsupported: "本站的配置原文无法可靠归属到结构化入口。请在配置中核对日志输出和格式。",
+    }[data.coverage];
+    const filter = (label, code, count) => {
+      const control = button(`${label} ${count}`, {
+        compact: true,
+        onClick: () => {
+          statusSelect.value = code;
+          statusSelect.dispatchEvent(new Event("change"));
+          statusSelect.focus();
+        },
+      });
+      control.dataset.logStatus = code;
+      return control;
+    };
+    const windowText = data.start && data.finish
+      ? `${fmtDateTime(data.start, { seconds: true })} 至 ${fmtDateTime(data.finish, { seconds: true })}`
+      : "暂无可见时间";
+    const retryable = data.coverage === "unavailable" || (data.coverage === "restricted" && !data.journalLines);
+    const unavailable = retryable || data.coverage === "unsupported";
+    summary.replaceChildren(
+      el("h3", null, "近期访问摘要"),
+      el("p", { class: "ecm-hint" },
+        `${windowText} · ${data.journalLines || 0} / ${data.requestedLines} 行 · ${coverage}`),
+      retryable ? button("重试日志读取", { compact: true, icon: "refresh-cw", onClick: () => refreshNow(true) }) : null,
+      unavailable ? null : metaGrid([
+        { label: "匹配请求", value: data.requests },
+        { label: "平均响应耗时", value: data.durationSamples ? `${fmtDurationMs(data.meanMs)}（${data.durationSamples} 条）` : "—" },
+      ]),
+      unavailable ? null : el("div", { class: "ecm-inline ecm-wrap", role: "group", "aria-label": "按状态分类筛选日志" },
+        filter("4xx", "4xx", data.clientErrors), filter("5xx", "5xx", data.serverErrors)),
+      unavailable ? null : el("p", { class: "ecm-hint" }, "统计本站可识别的 Journal 访问记录，范围为整个窗口。文件、其他输出及无法识别的记录不计入。"),
+    );
+    if (focusedClass) summary.querySelector(`[data-log-status="${focusedClass}"]`)?.focus({ preventScroll: true });
+  }
   let observer = null;
   let visibilityCheck = null;
 
@@ -1848,12 +1954,13 @@ export function logViewer(opts = {}) {
     }, delay);
   };
 
-  const refreshNow = () => {
+  const refreshNow = (explicit = false) => {
     abortInFlight();
     clearTimer();
     state.inFlight = false;
     state.fatalError = false;
-    if (shouldPoll()) schedule(0);
+    if (explicit && state.paused) poll(true);
+    else if (shouldPoll()) schedule(0);
   };
 
   const updateStatusText = () => {
@@ -1963,8 +2070,8 @@ export function logViewer(opts = {}) {
     updateStatusText();
   };
 
-  async function poll() {
-    if (!shouldPoll() || state.inFlight) {
+  async function poll(explicit = false) {
+    if ((!explicit && !shouldPoll()) || state.inFlight) {
       schedule(1000);
       return;
     }
@@ -1974,11 +2081,14 @@ export function logViewer(opts = {}) {
     try {
       let data;
       if (scope === "site") {
+        const statusClass = /^[45]xx$/.test(state.status) ? state.status[0] : undefined;
         data = await api.logsSite({
           slug,
           lines: state.lines,
           q: state.q || undefined,
-          status: state.status || undefined,
+          status: statusClass ? undefined : state.status || undefined,
+          statusClass,
+          signal: controller.signal,
         });
       } else {
         data = await api.logsService({
@@ -1988,10 +2098,16 @@ export function logViewer(opts = {}) {
         });
       }
       if (state.destroyed || controller.signal.aborted) return;
+      renderSummary(data?.summary);
       state.entries = Array.isArray(data && data.entries) ? data.entries : [];
-      state.note = (data && data.note) || null;
+      state.note = (data && data.note) || (state.entries.length ? null : {
+        unavailable: "日志不可用，请根据上方覆盖说明重试。",
+        restricted: "没有可显示的站点记录，请核对上方的权限说明。",
+        unsupported: "无法显示此配置的站点访问日志。",
+      }[data?.summary?.coverage]);
       state.error = null;
-      state.fatalError = false;
+      state.fatalError = ["unavailable", "unsupported"].includes(data?.summary?.coverage)
+        || (data?.summary?.coverage === "restricted" && !data.summary.journalLines);
       state.lastUpdated = new Date();
       state.fetchedOnce = true;
       renderEntries();
@@ -1999,18 +2115,19 @@ export function logViewer(opts = {}) {
       if (error && error.name === "AbortError") return;
       if (state.destroyed) return;
       state.error = error;
-      // A missing grant/unit or an unavailable journal will not fix itself in
-      // one second; keep the error and stop the 1s poll until the user retries.
-      const permanent = ["grant_missing", "journal_unavailable", "service_error", "host_error", "network_error"].includes(
+      // Pause polling on a backend or network error until the user retries.
+      const permanent = ["journal_unavailable", "service_error", "host_error", "network_error"].includes(
         error && error.code,
       ) || (error && error.status === 503);
       state.fatalError = permanent;
       renderError(error);
     } finally {
-      if (state.controller === controller) state.controller = null;
-      state.inFlight = false;
-      updateStatusText();
-      if (!state.destroyed && !state.fatalError) schedule(1000);
+      if (state.controller === controller) {
+        state.controller = null;
+        state.inFlight = false;
+        updateStatusText();
+        if (!state.destroyed && !state.fatalError) schedule(scope === "site" ? 4000 : 1000);
+      }
     }
   }
 

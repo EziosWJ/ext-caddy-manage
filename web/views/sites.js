@@ -47,13 +47,15 @@ function makeSelect(options, ariaLabel) {
   return select;
 }
 
+let previousList = null;
+
 export async function mount(root, ctx) {
+  const previous = previousList;
   const state = {
     items: [],
-    counts: null,
     groups: [],
     warnings: [],
-    filters: { q: "", type: "", status: "", group: "" },
+    filters: previous?.filters || { q: "", type: "", status: "", group: "" },
     selected: new Set(),
     loading: true,
     error: null,
@@ -67,13 +69,13 @@ export async function mount(root, ctx) {
     icon: "plus",
     onClick: () => ctx.navigate("#/sites/new"),
   });
-  const subtitle = el("p", { class: "ecm-page-sub" }, "加载站点中…");
+  const siteCount = el("span", { class: "ecm-chip", hidden: true });
 
   const header = pageHeader({
     title: "站点",
     actions: [refreshBtn, newBtn],
+    badges: siteCount,
   });
-  header.querySelector(".ecm-page-heading").append(subtitle);
 
   const searchInput = el("input", {
     class: "ecm-control ecm-search-input",
@@ -85,6 +87,9 @@ export async function mount(root, ctx) {
   const typeSelect = makeSelect(TYPE_OPTIONS, "类型筛选");
   const statusSelect = makeSelect(STATUS_OPTIONS, "状态筛选");
   const groupSelect = makeSelect([{ value: "", label: "全部分组" }], "分组筛选");
+  searchInput.value = previous?.search || "";
+  typeSelect.value = state.filters.type;
+  statusSelect.value = state.filters.status;
   const resetBtn = button("清除筛选", {
     variant: "ghost",
     icon: "x",
@@ -172,29 +177,6 @@ export async function mount(root, ctx) {
     groupSelect.value = "";
     state.selected.clear();
     renderResults();
-  }
-
-  function counts() {
-    if (state.counts && typeof state.counts === "object") {
-      const c = state.counts;
-      if (c.total !== undefined) {
-        return {
-          total: Number(c.total) || 0,
-          enabled: Number(c.enabled) || 0,
-          disabled: Number(c.disabled) || 0,
-          custom: Number(c.custom) || 0,
-          orphan: Number(c.orphan) || 0,
-        };
-      }
-    }
-    const result = { total: state.items.length, enabled: 0, disabled: 0, custom: 0, orphan: 0 };
-    for (const item of state.items) {
-      if (item.orphan) result.orphan += 1;
-      else if (item.enabled) result.enabled += 1;
-      else result.disabled += 1;
-      if (item.custom) result.custom += 1;
-    }
-    return result;
   }
 
   function groupValues() {
@@ -309,21 +291,30 @@ export async function mount(root, ctx) {
           compact: true,
           ariaLabel: `清理孤儿记录 ${item.name}`,
           title: "清理元数据",
-          onClick: () => cleanupOrphan(item),
+          onClick: () => deleteItem(item),
         }),
       );
       return wrap;
     }
-    wrap.append(
-      button("", {
+    const url = item.enabled && !item.conflict && item.urls?.[0];
+    if (url) {
+      wrap.append(el("a", { class: "ecm-link", href: url, target: "_blank", rel: "noopener noreferrer" }, "打开站点"));
+    }
+    const actions = el("div", { class: "ecm-toolbar" },
+      button(item.enabled ? "停用" : "启用", {
         variant: "ghost",
         icon: item.enabled ? "square" : "play",
         compact: true,
-        ariaLabel: item.enabled ? `停用站点 ${item.name}` : `启用站点 ${item.name}`,
-        title: item.enabled ? "停用" : "启用",
         onClick: () => toggleSite(item),
       }),
+      button("删除", {
+        variant: "ghost",
+        icon: "trash",
+        compact: true,
+        onClick: () => deleteItem(item),
+      }),
     );
+    wrap.append(el("details", { class: "ecm-site-actions" }, el("summary", null, "更多操作"), actions));
     return wrap;
   }
 
@@ -358,25 +349,31 @@ export async function mount(root, ctx) {
     }
   }
 
-  async function cleanupOrphan(item) {
+  async function deleteItem(item) {
     if (state.busy) return;
-    const ok = await confirmDialog({
-      title: "清理孤儿记录",
-      message: `清理「${item.name}」的站点元数据？磁盘上已不存在对应片段，站点目录不会被删除。`,
-      confirmLabel: "清理元数据",
-      danger: true,
-    });
-    if (!ok) return;
-    state.busy = true;
-    renderResults();
+    const metadataOnly = item.orphan;
+    const label = metadataOnly ? "清理元数据" : "删除站点";
     try {
-      await api.deleteSite(item.slug);
-      toast("孤儿元数据已清理。", "success");
+      const current = metadataOnly ? null : await api.site(item.slug);
+      const ok = await confirmDialog({
+        title: label,
+        message: metadataOnly
+          ? `清理「${item.name}」的站点元数据？磁盘上已不存在对应片段，站点目录会保留。`
+          : `删除「${item.name}」的配置片段？站点目录会保留，可在备份中恢复片段。`,
+        confirmLabel: label,
+        danger: true,
+      });
+      if (!ok || state.busy || state.destroyed) return;
+      state.busy = true;
+      renderResults();
+      await api.deleteSite(item.slug, current?.raw);
+      toast(metadataOnly ? "孤儿元数据已清理。" : "站点配置已删除。", "success");
       state.busy = false;
       await load({ silent: true });
     } catch (error) {
-      toast(error.message || "清理失败", "danger");
-      showMessage(feedback(error.message || "清理失败", "danger", { details: error.details }));
+      const message = error.message || `${label}失败`;
+      toast(message, "danger");
+      showMessage(feedback(message, "danger", { details: error.details }));
       state.busy = false;
       renderResults();
     }
@@ -432,9 +429,7 @@ export async function mount(root, ctx) {
   function emptyForFilters() {
     return emptyState({
       title: "没有匹配的站点",
-      body: "调整搜索关键字或筛选条件后再试。",
       icon: "search",
-      action: button("清除筛选", { variant: "secondary", icon: "x", onClick: resetFilters }),
     });
   }
 
@@ -442,8 +437,12 @@ export async function mount(root, ctx) {
     if (state.destroyed) return;
     syncGroupOptions();
     const visible = filteredItems();
-    const c = counts();
-    subtitle.textContent = `共 ${c.total} 个站点 · 启用 ${c.enabled} · 停用 ${c.disabled} · 自定义 ${c.custom} · 孤儿 ${c.orphan}`;
+    const empty = !state.loading && !state.error && state.items.length === 0;
+    filterbar.hidden = state.items.length === 0;
+    newBtn.hidden = empty;
+    resetBtn.disabled = !Object.values(state.filters).some(Boolean);
+    siteCount.hidden = state.items.length === 0 || Boolean(state.error);
+    siteCount.textContent = `${state.items.length} 个站点`;
     updateBatchBar(visible);
     scanNotice.replaceChildren();
     if (state.warnings.length > 0) {
@@ -475,10 +474,9 @@ export async function mount(root, ctx) {
       results.replaceChildren(
         emptyState({
           title: "还没有站点",
-          body: "创建第一个静态站点、反向代理或重定向；也可以直接在 conf.d 中手写片段。",
           icon: "globe",
           action: button("新建站点", {
-            variant: "secondary",
+            variant: "primary",
             icon: "plus",
             onClick: () => ctx.navigate("#/sites/new"),
           }),
@@ -548,9 +546,9 @@ export async function mount(root, ctx) {
       },
       {
         key: "domains",
-        label: "域名",
+        label: "访问地址",
         render: (item) => {
-          const domains = Array.isArray(item.domains) ? item.domains : [];
+          const domains = item.urls?.length && !item.conflict ? item.urls : item.domains || [];
           if (domains.length === 0) {
             return el("span", { class: "ecm-muted" }, item.orphan ? "无片段" : "—");
           }
@@ -615,8 +613,8 @@ export async function mount(root, ctx) {
       const data = await api.sites();
       if (state.destroyed) return;
       state.items = Array.isArray(data && data.items) ? data.items : [];
-      state.counts = data && data.counts ? data.counts : null;
       state.groups = Array.isArray(data && data.groups) ? data.groups : [];
+      state.warnings = Array.isArray(data && data.warnings) ? data.warnings : [];
       state.error = null;
       if (!opts.keepMessages) messages.replaceChildren();
       for (const slug of Array.from(state.selected)) {
@@ -640,7 +638,13 @@ export async function mount(root, ctx) {
   await load();
 
   return {
+    scrollTop: previous?.scrollTop ?? 0,
     destroy() {
+      previousList = {
+        filters: { ...state.filters, q: searchInput.value.trim().toLowerCase() },
+        search: searchInput.value,
+        scrollTop: window.scrollY,
+      };
       state.destroyed = true;
       clearTimeout(searchTimer);
     },

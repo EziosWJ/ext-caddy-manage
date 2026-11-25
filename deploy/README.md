@@ -1,8 +1,8 @@
 # ext-caddy-manage 部署与运维手册
 
-本手册面向部署 Extension Host（或 GoDesk）与 Caddy 的运维者，说明如何准备系统账号、目录权限、systemd、journald、服务授权与 sudoers，以及如何安装、配置、验证和升级本插件。
+本手册面向部署 Extension Host（或 GoDesk）与 Caddy 的运维者，说明如何准备系统账号、目录权限、systemd、journald 与 sudoers，以及如何安装、配置、验证和升级本插件。
 
-插件 id 为 `cn.ezios.ecm`，最低 Extension Host 版本 0.3.0。插件本身不安装 systemd unit、不写 sudoers、不改系统账号；这些由 `deploy/` 中的产物和 `install.sh` 完成。
+插件 id 为 `cn.ezios.ecm`。`deploy/install.sh` 准备 Caddy 账号、目录和 systemd unit。系统管理员负责配置 sudoers。
 
 ## 1. 部署拓扑
 
@@ -11,7 +11,7 @@
               │  └─ 插件 cn.ezios.ecm（纯 Lua）
               │       ├─ host.process.exec ──> /opt/caddy/caddy
               │       │     version / list-modules / validate / reload / fmt / hash-password
-              │       └─ host.services ──> systemctl（经 grants + sudoers 提权）
+              │       └─ host.services ──> systemctl（查询使用宿主账号，启停和重启可经 sudo 提权）
               │                          └─ journalctl（宿主账号读日志）
               └─ 配置文件写入 ──> /opt/caddy/config（属宿主账号，0644）
 Caddy（caddy 账号）── 只读 /opt/caddy/config 与 /opt/caddy/sites
@@ -21,7 +21,7 @@ Caddy（caddy 账号）── 只读 /opt/caddy/config 与 /opt/caddy/sites
 
 - 配置的文件系统是唯一真源；插件只写 `/opt/caddy/config` 下的文件。
 - 校验、格式化、热重载都直接调用 `/opt/caddy/caddy`，不需要提权；`caddy reload` 通过本机 Admin API `127.0.0.1:2019`。
-- 启动/停止/重启 systemd 单元才需要宿主级 sudoers 规则；插件从不执行 `sudo` 或 `systemctl`。
+- 插件对启动、停止和重启传入 `{ sudo = true }`，查询与日志由宿主账号执行。
 - Caddy 以专用 `caddy` 账号运行，对配置与站点目录只有读权限。
 
 ## 2. 前置条件
@@ -30,7 +30,7 @@ Caddy（caddy 账号）── 只读 /opt/caddy/config 与 /opt/caddy/sites
 - 运行 Extension Host 的账号已存在（示例使用 `godesk`），并且是未来写入配置的属主。
 - Caddy 使用官方 GitHub Release 的静态二进制，版本 ≥ 2.8（推荐 2.10.x），安装到 `/opt/caddy/caddy`，不使用 apt 包。
 - 宿主账号可执行 `sudo`（非 root 运行时）；80/443 端口空闲。
-- Extension Host ≥ 0.3.0（包含 `host.process.exec` 与 `host.services` 的 start/stop/restart/logs）。
+- Extension Host 需支持 `host.services` 的 `sudo` 选项，宿主源码当前版本为 0.3.0。
 - 插件包不包含 `deploy/` 与 `scripts/`（`ext pkg` 只打包 `manifest.json`、`web/`、`lua/`、`native/`），部署产物需要在仓库目录中执行。
 
 ## 3. 快速安装
@@ -49,7 +49,6 @@ sudo ./deploy/install.sh --host-user godesk
 | `--tarball <文件>` | 使用本地 `caddy_<版本>_linux_<架构>.tar.gz`，跳过下载；需同时指定 `--allow-unverified` |
 | `--host-user <账号>` | 运行 Extension Host 的账号，默认 `godesk` |
 | `--host-group <组>` | 宿主账号的组，默认取该账号主组 |
-| `--no-sudoers` | 不写 `/etc/sudoers.d/ext-caddy-manage` |
 | `--allow-unverified` | 允许使用无法校验的本地 tarball，或在 checksums.txt 不可用时继续（不推荐） |
 | `-h`, `--help` | 显示帮助 |
 
@@ -61,12 +60,11 @@ sudo ./deploy/install.sh --host-user godesk
 4. 创建 `/opt/caddy`（root:root 0755）、`/opt/caddy/config`、`config/conf.d`、`config/conf.d.disabled`、`/opt/caddy/sites`（宿主账号 0755）。
 5. **仅当 `/opt/caddy/config/Caddyfile` 不存在时**写入初始受管 Caddyfile；已存在则原样保留。
 6. 安装 `/etc/systemd/system/caddy.service`（内容变化时 daemon-reload），但不会启动或启用服务。
-7. 生成并校验 `/etc/sudoers.d/ext-caddy-manage`（0440），规则只允许宿主账号以 root 执行 `caddy.service` 的 `start`、`stop`、`restart`。已存在且内容相同时跳过。
-8. 打印后续步骤：启动服务、journal 组、服务授权、安装插件、配置项。
+7. 打印后续步骤，包括启动服务、配置 journal 组和系统 sudoers、安装与配置插件。
 
 脚本可重复执行；不会覆盖已有主 Caddyfile、不会改动现有站点片段、不会输出任何密钥。
 
-安装完成后仍需手工执行第 6–11 节的步骤。
+安装完成后仍需手工执行第 6–10 节的步骤。
 
 ## 4. 手动安装（不使用 install.sh）
 
@@ -108,12 +106,9 @@ sudo chown "$HOST_USER":"$HOST_USER" /opt/caddy/config/Caddyfile
 sudo chmod 0644 /opt/caddy/config/Caddyfile
 fi
 
-# 5) systemd unit 与 sudoers
+# 5) systemd unit
 sudo install -o root -g root -m 0644 deploy/caddy.service /etc/systemd/system/caddy.service
 sudo systemctl daemon-reload
-sudo sed 's/^godesk /'"$HOST_USER"' /' deploy/sudoers.example > /tmp/ext-caddy-manage.sudoers
-sudo visudo -cf /tmp/ext-caddy-manage.sudoers
-sudo install -o root -g root -m 0440 /tmp/ext-caddy-manage.sudoers /etc/sudoers.d/ext-caddy-manage
 ```
 
 ## 5. 文件与权限
@@ -161,7 +156,7 @@ sudo journalctl -u caddy.service -n 50 --no-pager
 
 ## 7. journald 日志权限
 
-`host.services.logs` 以宿主账号执行 `journalctl`，宿主账号必须属于 `systemd-journal` 组：
+`host.services.logs` 以宿主账号执行 `journalctl`。使用普通账号运行宿主时，可通过 `systemd-journal` 组授予读取权限：
 
 ```sh
 sudo usermod -aG systemd-journal godesk
@@ -170,46 +165,13 @@ id godesk
 journalctl -u caddy.service -n 5 --no-pager
 ```
 
-未加入时，插件日志页会提示“宿主账号需加入 systemd-journal 组”（`journal_unavailable`）。
+宿主返回日志读取权限错误时，插件日志页显示 `journal_unavailable` 并提示检查宿主账号的 `systemd-journal` 组权限。
 
 限制：日志窗口是整个 unit 的最近 N 行（100–2000，默认取插件配置 `logLines`）。高流量邻居可能把安静站点的旧访问日志挤出窗口；这不是插件能控制的。导出只导出当前窗口内容。
 
-## 8. 服务授权（grants）
+## 8. sudoers 提权
 
-使用服务能力需要同时满足：
-
-1. Manifest 声明 `services` 能力（本插件已声明）。
-2. 宿主启动时通过授权文件为本插件配置 `cn.ezios.ecm`。
-
-把 `deploy/grants.example.json` 合并到宿主使用的授权文件（与现有插件共存，不要整文件覆盖）：
-
-```json
-{
-  "cn.ezios.ecm": {
-    "units": ["caddy.service"],
-    "actions": ["list", "get", "start", "stop", "restart", "logs"],
-    "elevate": ["start", "stop", "restart"]
-  }
-}
-```
-
-| 字段 | 说明 |
-| --- | --- |
-| `units` | 允许访问的单元；必须是合法 `.service` 名 |
-| `actions` | `list`、`get`、`start`、`stop`、`restart`、`logs` |
-| `elevate` | 仅 `start`、`stop`、`restart`；必须同时出现在 `actions` 中 |
-
-传递方式：
-
-- 独立宿主：`ext serve --service-grants /etc/extension-host/service-grants.json`（示例路径，按实际部署填写）
-- 开发/单插件：`ext run <包目录或 ZIP> --service-grants <文件> --data-dir <目录>`
-- GoDesk：通过 `--extension-grants` 传入同一份文件
-
-修改授权文件后必须重启宿主。未授权时插件返回 `grant_missing`，提示“部署授权文件未包含该单元/操作”。
-
-## 9. sudoers 提权
-
-宿主以非 root 运行时，`elevate` 中的操作通过以下形式执行：
+插件对启动、停止和重启传入 `{ sudo = true }`。非 root 宿主执行对应的非交互 sudo 命令，例如：
 
 ```sh
 sudo -n -k -u root -- /usr/bin/systemctl start --no-ask-password -- caddy.service
@@ -227,7 +189,7 @@ Cmnd_Alias CADDY_SERVICE = \
 godesk ALL=(root) NOPASSWD: CADDY_SERVICE
 ```
 
-安装与校验（将 `godesk` 换成实际宿主账号）：
+由系统管理员安装与校验（将 `godesk` 换成实际宿主账号）：
 
 ```sh
 sed 's/^godesk /<宿主账号> /' deploy/sudoers.example > /tmp/ext-caddy-manage.sudoers
@@ -244,13 +206,12 @@ sudo -n -k -u root -- /usr/bin/systemctl start --no-ask-password -- caddy.servic
 
 注意：
 
-- 将 `godesk` 替换为实际宿主账号；`install.sh --host-user` 会自动处理。
-- 如果 `systemctl` 不在 `/usr/bin/systemctl`，需要同时调整 sudoers 与宿主代码路径；Ubuntu 24.04 默认路径一致。
+- 如果 `systemctl` 不在 `/usr/bin/systemctl`，sudoers 中的路径需匹配宿主找到的 `systemctl` 路径。
 - 规则过宽（例如允许 `systemctl *`）会扩大提权面，不推荐。
-- 宿主以 root 运行时不需要 sudoers，但仍需要 grants。
-- 提权失败时插件返回 `privilege_missing`，提示“宿主账号缺少 sudoers 规则”。
+- 宿主以 root 运行时直接调用 `systemctl`。
+- 启停或重启遇到权限错误时，插件返回 `privilege_missing`，并提示检查宿主账号与系统 sudoers。
 
-## 10. 安装插件与配置
+## 9. 安装插件与配置
 
 打包（在仓库根目录）：
 
@@ -285,11 +246,11 @@ ext pkg
 - 如果主 Caddyfile 不在默认路径，务必同步修改 `mainConfig`，否则初始化会写到别处。
 - 配置值非法（相对路径、空值、越界数字）时，插件回退到默认值并在诊断中给出警告。
 
-## 11. 首次初始化与验证
+## 10. 首次初始化与验证
 
 1. 打开插件页面，进入「诊断」。
 2. 若主 Caddyfile 尚未创建，点击「生成初始配置」。如果文件已存在且非空，插件会要求二次确认，绝不静默覆盖。
-3. 诊断清单应全部正常：二进制、版本、主 Caddyfile、受管标记、片段目录、停用目录、站点根目录、systemd 单元、服务授权、journald、模块、整体校验。
+3. 诊断清单应全部正常：二进制、版本、主 Caddyfile、受管标记、片段目录、停用目录、站点根目录、systemd 单元、journald、模块、整体校验。
 4. 打开「全局配置」，确认受管块：
 
    ```caddyfile
@@ -319,9 +280,9 @@ systemctl is-active caddy.service
 curl -sS -H 'Host: example.com' http://127.0.0.1/
 ```
 
-服务控制验证：在概览页点击启动/停止/重启；失败时按第 13 节排查。日志页应显示 `journalctl -o short-iso` 的输出，并能按站点域名过滤。
+服务控制验证：在概览页点击启动/停止/重启；失败时按第 12 节排查。日志页应显示 `journalctl -o short-iso` 的输出，并能按站点域名过滤。
 
-## 12. 日常运维
+## 11. 日常运维
 
 备份：
 
@@ -343,7 +304,7 @@ sudo systemctl restart caddy.service
 
 升级前建议备份 `/opt/caddy/config` 与插件数据目录。插件会执行 `caddy validate`，发现不兼容会拒绝写入。
 
-升级插件：重新 `ext pkg` 并在宿主安装新 ZIP；业务数据与配置保留。宿主的 `run` 会先卸载同 ID 插件（默认保留业务数据）。
+升级独立 Extension Host 上的插件时，先记录当前 Host 插件配置，并备份宿主数据、Caddyfile 与片段。重新打包后，在 `/host/` 卸载旧版本时保留业务数据，安装新 ZIP，在启用前恢复插件配置。Host 0.3.0 重新安装时会把插件设置重置为 Manifest 默认值。保留业务数据可让新版本继续读取原来的站点快照和配置备份。核对路径、服务单元、日志行数、证书探测周期及备份保留数后，再执行一次配置预览与加载。
 
 卸载：
 
@@ -352,16 +313,15 @@ sudo systemctl restart caddy.service
 3. 按需删除 `/etc/systemd/system/caddy.service`、`/etc/sudoers.d/ext-caddy-manage`、`/opt/caddy`。删除 `/opt/caddy/sites` 会丢失站点文件，先确认。
 4. `sudo systemctl daemon-reload`。
 
-## 13. 故障排查
+## 12. 故障排查
 
 | 现象/错误码 | 常见原因 | 处理 |
 | --- | --- | --- |
 | `caddy_missing` | 二进制路径错误或不可执行 | 检查 `caddyBinary`、`ls -l /opt/caddy/caddy`、手动执行 `caddy version` |
 | `not_initialized` | 主 Caddyfile 不存在 | 诊断页点“生成初始配置”，或手动创建 |
 | `markers_missing` | 主配置缺少受管标记行 | 恢复标记块；全局表单禁用时可用原文编辑 |
-| `grant_missing` | 宿主未加载 grants 或单元/操作未授权 | 合并 `deploy/grants.example.json`，重启宿主 |
-| `privilege_missing` | sudoers 规则缺失或命令不匹配 | 安装 `sudoers.example`，核对路径与参数 |
-| `journal_unavailable` | 宿主账号不在 `systemd-journal` 组 | `usermod -aG systemd-journal <账号>`，重新登录 |
+| `privilege_missing` | 宿主账号权限不足或 sudoers 命令不匹配 | 查询失败时核对账号的 systemd 读取权限。启停或重启失败时核对系统 sudoers 中的路径与参数 |
+| `journal_unavailable` | 日志读取权限不足或 `journalctl` 不可用 | 检查 `journalctl` 和宿主账号的 `systemd-journal` 组权限 |
 | `reload_failed`（connection refused） | Caddy 未运行或 Admin API 地址不一致 | 启动服务；确认受管块中 `admin 127.0.0.1:2019` |
 | `validate_failed` | Caddyfile 语法/导入/站点片段错误 | 查看错误中的文件与行号；修复后重试 |
 | 站点 403 | 站点根目录或配置不可被 caddy 读取 | 修复 `/opt/caddy` 属主与 0755/0644 |
@@ -372,14 +332,37 @@ sudo systemctl restart caddy.service
 
 查看宿主与插件日志：宿主的 `--data-dir` 下 `logs/<插件 id>-<版本>.log`，以及运行宿主的终端输出。
 
-## 14. 安全清单
+## 13. 安全清单
 
 - 独立宿主默认只监听 `127.0.0.1:5001` 且没有登录；不要直接暴露到公网，远程访问请置于带认证的反向代理之后。
 - sudoers 只授予三条完整命令；不要放宽为 `systemctl *`。
-- grants 只列 `caddy.service` 与所需动作。
 - Caddy 以无特权 `caddy` 账号运行，仅通过 AmbientCapabilities 绑定低端口。
 - 配置与站点目录属宿主账号，`caddy` 只读；插件不写 `/var/lib/caddy`。
 - 插件备份 0600；插件不会把密码、提交的明文密码或完整模型写入日志。
 - Basic Auth 的 bcrypt 哈希会出现在站点片段中（0644），视为敏感配置；不要将配置目录共享给不受信任的账号。
 - Caddy Admin API 保持在回环地址；受管全局块中的 `admin` 行不要改成公网地址。
 - 插件写入使用同目录临时文件 + rename，并在应用前备份、整体校验；reload 失败自动回滚，回滚失败会保留备份并明确报错。
+
+## 内网 HTTPS
+
+1. 站点地址填写客户端会使用的域名或 IP。用「监听范围」选择回环地址、本机网卡上的具体 IP，或所有接口。客户端用域名时，应将域名解析到能访问的监听地址。端口由表单单独配置。
+2. 保存并加载后，在站点详情读取运行实例的公开根 CA。此功能访问当前主 Caddyfile 指定的回环或本机 Unix Admin 地址。确认可信渠道提供的 SHA-256 指纹，再将下载的根证书导入客户端的系统或浏览器信任库。
+3. 在站点详情检测后分别检查本机连接、证书签发、宿主信任及 HTTP 响应。从客户端打开预览的 URL，核对该客户端的信任与网络访问。使用代理或防火墙做额外隔离时，确保可以访问所选端口。Caddy 对同一端口上的站点按实际绑定的地址组分配请求。如果同时配置通配监听和具体地址监听，使用独立端口可避免同端口监听相互覆盖。 [Caddy bind 文档](https://caddyserver.com/docs/caddyfile/directives/bind)
+
+## DNS-01
+
+V0.2 在诊断页显示完整模块 ID 和检测结果。如生产环境使用系统服务，核对诊断中的磁盘构建和运行构建。服务权限阻止比较时，管理员可比对 `systemctl show -p MainPID --value caddy.service` 所得 PID 的 `/proc/<PID>/exe` 与 `caddyBinary` 的校验和，并分别执行 `list-modules`。二进制替换后需由服务重新启动才能切换运行构建。
+
+| 模块 ID | 最小权限评估 |
+| --- | --- |
+| `dns.providers.cloudflare` | 首选。单个 API Token 限制到目标 Zone，授予 `Zone.Zone:Read` 和 `Zone.DNS:Edit`。 [Cloudflare 模块](https://github.com/caddy-dns/cloudflare#configuration) |
+| `dns.providers.alidns` | 用专用 RAM 身份评估目标域的查询与 TXT 创建、更新、删除权限。核对所选版本调用的 API 及可用的资源范围，再单独验收。 [AliDNS 模块](https://github.com/caddy-dns/alidns) |
+| `dns.providers.tencentcloud` | 用专用 CAM 身份，核对所选 DNSPod API 的记录查询和 TXT 创建、更新、删除权限，尽量限定目标域，再单独验收。 [腾讯云模块](https://github.com/caddy-dns/tencentcloud) [DNSPod libdns](https://github.com/libdns/tencentcloud) |
+
+Cloudflare 验收流程：
+
+1. 记录 xcaddy、Caddy、模块及 Go 的固定版本和构建校验和。在隔离环境中执行 `xcaddy build "$CADDY_VERSION" --with "github.com/caddy-dns/cloudflare@$CF_MODULE_VERSION" --output ./caddy`，确认 `list-modules` 包含 `dns.providers.cloudflare`。先留存当前运行的二进制和配置。
+2. 管理员在 systemd 的 `EnvironmentFile=` 中引用 root 持有的 0600 凭据文件。确认实际 `ExecStart` 已移除 `--environ`，更新 unit 后执行 `daemon-reload`。在 Caddyfile 中使用 `tls { dns cloudflare {env.CLOUDFLARE_API_TOKEN} }` 的多行形式。保留运行期 `{env.…}` 引用。适配期 `{$…}` 会将值展开到 JSON。凭据文件保存在服务部署侧，避免进入插件设置、表单、Caddyfile、备份和常规诊断输出。 [Cloudflare Caddyfile 配置](https://github.com/caddy-dns/cloudflare#caddyfile-examples)
+3. 在隔离的同构服务中，用受保护的服务环境验证配置、启动及热装载。用错误候选验证回滚和旧站点应答。限制服务日志访问，检查 `journalctl` 和校验、重载失败输出是否泄露令牌。诊断或工单只保存已脱敏的错误。若此前启用了环境打印，检查历史日志中是否出现令牌并轮换受影响的凭据。
+4. 使用 ACME staging、独立存储和测试 Zone 验证 DNS TXT 创建与清理、首次签发及真正的续期。记录新旧证书序列号、有效期及 TXT 清理结果。通配符使用具体子域名做 SNI/HTTP 验证。根域单列为证书标识并独立验证，因为 `*.example.com` 只覆盖单级子域。staging 证书使用对应测试 CA 验证。 [Caddy 自动 HTTPS](https://caddyserver.com/docs/automatic-https)
+5. 固定组合通过上述检查后再开放 Cloudflare 表单。本版本交付模块检测和管理员部署指引。

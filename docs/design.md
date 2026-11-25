@@ -42,24 +42,9 @@
   - 插件数据（宿主管理）：`<宿主 data-dir>/plugins/cn.ezios.ecm/data`
 - 账号：Caddy 以专用 `caddy` 用户运行；配置与站点目录属宿主账号，权限 0755/0644，Caddy 只读。
 - 日志：Caddy 运行时日志与访问日志统一写 stderr，由 journald 收集。宿主账号加入 `systemd-journal` 组；unit 关闭 journald 限流（`LogRateLimitBurst=0`），避免高流量时访问日志被丢弃。
-- 服务控制：插件只调用 `host.services.start/stop/restart/logs` 与 `get`，不执行 `systemctl`/`sudo`。宿主账号需要一条宿主级 sudoers 规则（非插件级），例如：
-
-  ```sudoers
-  Cmnd_Alias CADDY_SERVICE = \
-    /usr/bin/systemctl start --no-ask-password -- caddy.service, \
-    /usr/bin/systemctl stop --no-ask-password -- caddy.service, \
-    /usr/bin/systemctl restart --no-ask-password -- caddy.service
-  godesk ALL=(root) NOPASSWD: CADDY_SERVICE
-  ```
-
-  对应授权文件：
-  ```json
-  {"cn.ezios.ecm": {"units": ["caddy.service"],
-    "actions": ["list", "get", "start", "stop", "restart", "logs"],
-    "elevate": ["start", "stop", "restart"]}}
-  ```
+- 服务控制：启动、停止与重启通过 `host.services` 传入 `{ sudo = true }`，查询与日志使用宿主账号。非 root 宿主的提权规则由系统管理员配置，示例见 `deploy/sudoers.example`。
 - 配置校验/重载/格式化/哈希：通过 `host.process.exec` 调用 `/opt/caddy/caddy`，不需要提权；`caddy reload` 走本机 Admin API `127.0.0.1:2019`。
-- 插件不自行安装 unit、不写 sudoers、不改系统账号；`deploy/` 只提供 unit、install.sh、sudoers 示例与 README。
+- 插件不自行安装 unit、不写 sudoers、不改系统账号；`deploy/` 提供 unit、install.sh、系统管理员使用的 sudoers 示例与 README。
 
 ### 推荐的 caddy.service
 
@@ -71,7 +56,7 @@ After=network.target
 [Service]
 User=caddy
 Group=caddy
-ExecStart=/opt/caddy/caddy run --environ --config /opt/caddy/config/Caddyfile --adapter caddyfile
+ExecStart=/opt/caddy/caddy run --config /opt/caddy/config/Caddyfile --adapter caddyfile
 ExecReload=/opt/caddy/caddy reload --config /opt/caddy/config/Caddyfile --adapter caddyfile
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -85,7 +70,7 @@ WantedBy=multi-user.target
 
 ## 3. 宿主能力依赖（以当前工作区为准）
 
-- `host.services.list/get/start/stop/restart/logs`：按 grant 过滤，`elevate` 仅对 start/stop/restart 生效；`logs(unit, lines)` 返回整个 unit 最近 N 行（`journalctl ... -o short-iso`）。
+- `host.services.list/get/start/stop/restart/logs`：查询与日志以宿主账号运行，`{ sudo = true }` 仅用于 start/stop/restart；`logs(unit, lines)` 返回整个 unit 最近 N 行（`journalctl ... -o short-iso`）。
 - `host.process.exec(program, args[, options])`：
   - `options.stdin`：string，可选；省略时子进程读取到 EOF。
   - `options.timeoutMs`：正整数，默认 30000。
@@ -224,7 +209,7 @@ CREATE TABLE IF NOT EXISTS meta (
 约束：
 
 - `slug`：`[a-z0-9-]{1,64}`，创建时由名称或首个域名生成，全站唯一，创建后不可改。
-- 域名：小写字母/数字/`-`/`.`，或 `localhost`；禁止通配符、协议、路径、端口、IP。一个站点最多 20 个域名，全站域名唯一。
+- 站点地址：域名支持字母、数字、`-` 与 `.`。`127.0.0.1:<端口>` 和 `localhost:<端口>` 仅绑定 IPv4 回环地址。`0.0.0.0:<端口>` 绑定全部 IPv4 网卡，接受任意 Host。这三种地址均使用 HTTP。一个站点最多 20 个地址，同一个地址只能由一个站点使用。
 - `basicAuth` 用户名 `[A-Za-z0-9._-]{1,64}`，最多 20 个；哈希只接受 `$2[abxy]$` bcrypt。
 - 上游：`host:port`、`http://host:port`、`https://host:port`、`[v6]:port`；最多 20 个。Caddy 的 `reverse_proxy` 接受两种写法：全部上游都不带 scheme，或全部上游显式使用同一 scheme。混合写法对顺序敏感且可能改变 TLS 行为（例如全部不带 scheme 时 Caddy 按 HTTP 处理，即使端口是 443），插件拒绝混合，要求「全裸地址」或「同一显式 scheme」（实测 Caddy 2.10.2）。
 - 响应头名称/值不得含换行；最多 20 个。
@@ -336,18 +321,17 @@ old.example.com, www.old.example.com {
 ### 9.1 服务
 
 - 状态：`host.services.get(unit)`，展示 state、stateDetail、MainPID、ActiveEnterTimestamp。
-- 启动/停止/重启：`host.services.start/stop/restart`。
+- 启动/停止/重启：`host.services.start/stop/restart(unit, { sudo = true })`。
 - 重载：先 `validate`，再 `caddy reload`（不是 `systemctl reload`，便于拿到错误输出）。
 - 错误映射：
-  - `forbidden` / 「no capability grant」→ `grant_missing`，提示部署授权文件。
-  - `permission` → `privilege_missing`，提示宿主级 sudoers 规则。
-  - journal 读取失败 → `journal_unavailable`，提示 `systemd-journal` 组。
+  - 启停、重启或查询返回 `permission` 时映射为 `privilege_missing`，分别提示检查系统 sudoers 或宿主账号的查询权限。
+  - 日志返回 `permission` 或 `logs_unavailable` 时映射为 `journal_unavailable`，分别提示检查 `systemd-journal` 组权限或 `journalctl`。
 
 ### 9.2 日志
 
 - 数据源：`host.services.logs(unit, lines)`；行格式 `TIMESTAMP HOST IDENT[PID]: MESSAGE`。
 - 判定：截取 `]: ` 之后为 MESSAGE；以 `{` 开头且 JSON 解析成功、`logger == "http.log.access"` 的为访问日志；其余为服务日志。
-- 站点日志：在窗口内按 `request.host` 匹配站点域名（忽略大小写与端口），解析 `method`、`uri`、`status`、`duration`、`remote_ip`、`user_agent`、`size`。
+- 站点日志：在窗口内按 `request.host` 匹配站点地址，忽略大小写，回环地址保留端口。监听所有 IPv4 网卡的站点通过独立的访问日志名称识别监听端口。解析 `method`、`uri`、`status`、`duration`、`remote_ip`、`user_agent`、`size`。
 - 服务日志：展示非访问日志行；可切换「包含访问日志」。
 - 过滤：关键字（子串）、状态码；站点页自动按域名过滤。
 - 行数：`lines` 100–2000，默认取配置的 500。窗口是「整个 unit 最近 N 行」，高流量邻居可能把安静站点的旧行挤出窗口；「加载更多」拉满 2000 行，文档写明限制。
@@ -380,7 +364,7 @@ old.example.com, www.old.example.com {
 {"ok": false, "error": {"code": "conflict", "message": "...", "details": ...}}
 ```
 
-HTTP 状态：200 成功，400 参数/模型错误，404 不存在，409 冲突，503 依赖不可用（Caddy/服务/授权/日志），500 内部错误。请求体上限 1 MiB，原始配置内容上限 48 KiB。
+HTTP 状态：200 成功，400 参数/模型错误，404 不存在，409 冲突，503 依赖不可用（Caddy/服务/系统权限/日志），500 内部错误。请求体上限 1 MiB，原始配置内容上限 48 KiB。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -446,7 +430,7 @@ HTTP 状态：200 成功，400 参数/模型错误，404 不存在，409 冲突�
   - 日志：跟随、暂停、过滤、导出。
   - 配置文件：原文编辑（等宽字体）、校验、格式化、diff、保存；漂移横幅与「以磁盘为准 / 用表单覆盖」。
 - **全局配置**：受管块表单（邮箱、staging、额外全局指令）+ 主配置原文编辑器 + 备份。
-- **诊断**：二进制与版本、目录可写、Caddyfile 与标记、conf.d、站点根目录可读、unit 状态、grant、journal 权限、sudo 提权、模块检测（l4/ratelimit/DNS）、整体 validate；「生成初始配置」按钮（已存在非空文件时需确认，绝不静默覆盖）。
+- **诊断**：二进制与版本、目录可写、Caddyfile 与标记、conf.d、站点根目录可读、unit 状态、journal 读取、sudo 提权说明、模块检测（l4/ratelimit/DNS）、整体 validate；「生成初始配置」按钮（已存在非空文件时需确认，绝不静默覆盖）。
 - 所有破坏性操作二次确认，写明对象与后果；停用说明站点将停止服务；删除说明保留目录。
 - 配置无效/未初始化时全站横幅，链接到诊断。
 - 日志轮询只在对应 tab 可见时进行；切页停止。请求进行中禁用重复提交。
@@ -474,7 +458,7 @@ lua/
 web/
   index.html app.js api.js views/*.js components.js format.js style.css
 deploy/
-  caddy.service install.sh sudoers.example grants.example.json README.md
+  caddy.service install.sh sudoers.example README.md
 scripts/
   e2e.sh
 ```
@@ -495,7 +479,7 @@ scripts/
 
 ### 14.2 手工验收清单
 
-- 安装/启用插件，配置 grant 与 sudoers，启动/停止/重启/重载。
+- 安装/启用插件，由系统管理员配置 sudoers，启动/停止/重启/重载。
 - journald 中按站点过滤访问日志，验证 1 秒轮询、暂停、导出。
 - 真实域名自动 HTTPS、staging 切换、证书到期显示。
 - Basic Auth 登录成功/失败；IP 允许/拒绝；HSTS 头。
@@ -529,7 +513,7 @@ scripts/
 
 阶段 4：交付
 
-14. `deploy/` 产物与 README（unit、install.sh、sudoers、grants）。
+14. `deploy/` 产物与 README（unit、install.sh、sudoers 示例）。
 15. `scripts/e2e.sh` 与手工验收清单。
 
 ## 16. 风险与已知限制
@@ -558,5 +542,5 @@ scripts/
 - 上游只允许「全部不带 scheme」或「全部显式同一 scheme」；混合写法在模型校验阶段拒绝。
 - IPv6 上游与 IP 列表做完整的结构校验，避免 Caddy adapt 阶段不拒绝、运行时才失败。
 - 配置目录可以是被跟随的符号链接；配置文件本身是符号链接时读取可用，写入/移动/删除会拒绝。
-- 无 systemd 授权且服务状态未知时，先用 openssl 探测受管 admin 端点；不可达则保存但不重载，可达才执行 reload 并保留失败回滚。
+- 服务状态未知时，先用 openssl 探测受管 admin 端点；不可达则保存但不重载，可达才执行 reload 并保留失败回滚。
 - 前端全站横幅覆盖未初始化、缺少受管标记、片段目录未导入三种状态；站点/全局表单在请求期间禁用输入，原文保存前会确认未保存的表单修改。

@@ -117,17 +117,33 @@ export const api = {
     return request("overview");
   },
 
+  metrics(refresh = false) {
+    return refresh ? post("metrics") : request("metrics");
+  },
+  siteCheck(slug, index) {
+    return post("site/check", { slug, index });
+  },
+
   sites() {
     return request("sites");
   },
   site(slug) {
     return request("site", { query: { slug } });
   },
-  createSite(model) {
-    return post("site", { model });
+  createSite(model, publish) {
+    return post("site", { model, publish });
+  },
+  localListeners() {
+    return request("local-listeners");
+  },
+  probeLocalListener(candidateId) {
+    return post("local-listeners/probe", { candidateId });
   },
   updateSite(slug, model, baseline, force) {
     return post("site/update", { slug, model, baseline, force: Boolean(force) });
+  },
+  previewSite(slug, model) {
+    return post("site/preview", { slug, model });
   },
   saveRaw(slug, content, baseline, force) {
     return post("site/raw", { slug, content, baseline, force: Boolean(force) });
@@ -155,6 +171,14 @@ export const api = {
       extra: form.extra,
       baseline,
       force: Boolean(force),
+    });
+  },
+  previewGlobal(form, baseline) {
+    return post("global/preview", {
+      email: form.email,
+      staging: Boolean(form.staging),
+      extra: form.extra,
+      baseline,
     });
   },
   saveGlobalRaw(content, baseline, force) {
@@ -186,8 +210,8 @@ export const api = {
       query: { lines, q, includeAccess: includeAccess ? "1" : undefined },
     });
   },
-  logsSite({ slug, lines, q, status } = {}) {
-    return request("logs/site", { query: { slug, lines, q, status } });
+  logsSite({ slug, lines, q, status, statusClass, signal } = {}) {
+    return request("logs/site", { query: { slug, lines, q, status, statusClass }, signal });
   },
   exportUrl({ scope, slug, lines } = {}) {
     return buildUrl("logs/export", { scope, slug, lines }).toString();
@@ -195,6 +219,12 @@ export const api = {
 
   certs() {
     return request("certs");
+  },
+  siteEntryCheck(slug, index, { get } = {}) {
+    return request("site/entry-check", { query: { slug, index, get } });
+  },
+  siteRootCA(slug) {
+    return request("site/root-ca", { query: { slug } });
   },
   refreshCerts(force) {
     return post("certs/refresh", { force: Boolean(force) });

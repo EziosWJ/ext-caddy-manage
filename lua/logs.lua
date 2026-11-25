@@ -1,6 +1,7 @@
 -- journald and Caddy access-log parsing, filtering and export.
 local util = require("util")
 local services = require("services")
+local sites = require("sites")
 
 local M = {}
 
@@ -48,7 +49,8 @@ function M.parseAccess(message)
   if type(message) ~= "string" or message:sub(1, 1) ~= "{" then return nil end
   local ok, obj = pcall(util.jsonDecode, message)
   if not ok or type(obj) ~= "table" then return nil end
-  if obj.logger ~= "http.log.access" then return nil end
+  local listenerPort = type(obj.logger) == "string" and obj.logger:match("^http%.log%.access%.ecm%-ipv4%-(%d+)$")
+  if obj.logger ~= "http.log.access" and not listenerPort then return nil end
 
   local request = obj.request
   if type(request) ~= "table" then request = {} end
@@ -68,10 +70,11 @@ function M.parseAccess(message)
     uri = stringOrEmpty(request.uri, 1024),
     status = status,
     durationMs = durationMs,
+    durationSeconds = type(obj.duration) == "number" and obj.duration >= 0 and obj.duration or nil,
     size = size,
     remoteIp = stringOrEmpty(request.remote_ip, 64),
     userAgent = clip(firstHeaderValue(request.headers), 512),
-  }
+  }, listenerPort
 end
 
 -- Lowercase, drop a :port suffix (outside IPv6 brackets), drop trailing dot.
@@ -81,24 +84,14 @@ function M.normalizeHost(host)
   if s == "" then return "" end
   if s:sub(1, 1) == "[" then
     local close = s:find("]", 1, true)
-    if close and s:sub(close + 1):match("^:%d+$") then
-      s = s:sub(1, close)
+    if close and (close == #s or s:sub(close + 1):match("^:%d+$")) then
+      s = s:sub(2, close - 1)
     end
-  else
+  elseif not s:match(":.*:") then
     s = s:gsub(":%d+$", "")
   end
   s = s:gsub("%.$", "")
   return s
-end
-
-function M.matchHost(host, domains)
-  local normalized = M.normalizeHost(host)
-  if normalized == "" or type(domains) ~= "table" then return false end
-  for i = 1, #domains do
-    local d = domains[i]
-    if type(d) == "string" and util.lower(d) == normalized then return true end
-  end
-  return false
 end
 
 local function matchQuery(q, ...)
@@ -113,51 +106,102 @@ local function matchQuery(q, ...)
   return false
 end
 
--- Access entries for a site's domains from a journal window.
-function M.siteEntries(unit, domains, lines, opts)
+-- Newest-first keeps the freshest complete entries when Host caps stdout at 64 KiB.
+-- The raw window is shared across site polls and filter changes for four seconds.
+local windowCache
+local function accessWindow(unit, lines)
+  local now = util.nowEpoch()
+  if windowCache and windowCache.unit == unit and windowCache.lines == lines
+    and now >= windowCache.at and now - windowCache.at < 4 then return windowCache end
+  local ok, result = pcall(host.process.exec, "env", {
+    "LC_ALL=C", "journalctl",
+    "--unit=" .. unit, "--lines=" .. tostring(lines), "--reverse", "--no-pager", "--output=short-iso",
+  }, { timeoutMs = 2000 })
+  local window = { unit = unit, lines = lines, at = util.nowEpoch(), rows = {} }
+  local stderr = ok and result and (result.stderr or ""):lower() or ""
+  if stderr:find("permission", 1, true) or stderr:find("not seeing messages", 1, true)
+    or stderr:find("insufficient", 1, true) then
+    window.coverage = "restricted"
+  elseif not ok or not result or result.exitCode ~= 0 or result.timedOut or result.error then
+    window.coverage = "unavailable"
+  end
+  local raw = ok and result and result.stdout or ""
+  if not window.coverage or window.coverage == "restricted" then
+    local truncated = result.stdoutTruncated
+    if truncated then raw = raw:match("^(.*\n)") or "" end
+    local rows = {}
+    for _, line in ipairs(util.splitLines(raw)) do
+      local parsed = M.parseJournalLine(line)
+      if parsed.time:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d") then
+        local entry, listenerPort = M.parseAccess(parsed.message)
+        if entry then entry.time = parsed.time end
+        rows[#rows + 1] = { time = parsed.time, entry = entry, listenerPort = listenerPort }
+      end
+    end
+    window.rows = rows
+    window.truncated = truncated
+    window.coverage = window.coverage or (truncated and "truncated"
+      or (#rows == 0 and "empty" or (#rows >= lines and "line_limit" or "window")))
+  end
+  windowCache = window
+  return window
+end
+
+local function belongs(entry, model, listenerPort, ports)
+  if listenerPort then return util.contains(model.domains, "0.0.0.0:" .. listenerPort) end
+  local name = M.normalizeHost(entry.host)
+  local port
+  if entry.host:sub(1, 1) == "[" then port = entry.host:match("%]:(%d+)$")
+  elseif not entry.host:match(":.*:") then port = entry.host:match(":(%d+)$") end
+  port = tonumber(port)
+
+  if model.access then
+    name = sites.canonicalIP(name) or name
+    return (not port or port == sites.accessPort(model.access)) and util.contains(model.domains, name)
+  end
+  if port and util.contains(model.domains, name .. ":" .. port) then return true end
+  if not util.contains(model.domains, name) then return false end
+  return not port or not ports or port == ports.http or (model.https ~= false and port == ports.https)
+end
+
+function M.siteEntries(unit, model, lines, opts)
   opts = opts or {}
   local entries = util.array({})
-  local raw, err = services.logs(unit, lines)
-  if not raw then
-    return { entries = entries, error = err }
+  local summary = { requests = 0, clientErrors = 0, serverErrors = 0, durationSamples = 0, requestedLines = lines }
+  if not model then
+    summary.coverage = "unsupported"
+    return { entries = entries, summary = summary }
   end
-
-  local domainSet = {}
-  if type(domains) == "table" then
-    for i = 1, #domains do
-      if type(domains[i]) == "string" then domainSet[util.lower(domains[i])] = true end
-    end
-  end
+  local window = accessWindow(unit, lines)
+  local rows = window.rows
+  summary.coverage = window.coverage
+  summary.truncated = window.truncated or false
+  summary.journalLines = #rows
+  summary.start = rows[#rows] and rows[#rows].time
+  summary.finish = rows[1] and rows[1].time
   local q = type(opts.q) == "string" and util.lower(opts.q) or nil
-  local statusFilter = nil
-  if type(opts.status) == "number" then
-    statusFilter = opts.status
-  elseif type(opts.status) == "string" and opts.status:match("^%d+$") then
-    statusFilter = tonumber(opts.status)
-  end
-
-  for i = 1, #raw do
-    local parsed = M.parseJournalLine(raw[i])
-    local access = M.parseAccess(parsed.message)
-    if access and domainSet[M.normalizeHost(access.host)] then
-      local keep = matchQuery(q, access.method, access.uri, access.userAgent, access.host)
-      if keep and statusFilter and access.status ~= statusFilter then keep = false end
-      if keep then
-        entries[#entries + 1] = {
-          time = clip(parsed.time, 64),
-          host = access.host,
-          method = access.method,
-          uri = access.uri,
-          status = access.status,
-          durationMs = access.durationMs,
-          size = access.size,
-          remoteIp = access.remoteIp,
-          userAgent = access.userAgent,
-        }
+  local seconds, exactStatus = 0, tonumber(opts.status)
+  for i = #rows, 1, -1 do
+    local row = rows[i]
+    local entry = row.entry
+    if entry and belongs(entry, model, row.listenerPort, opts.ports) then
+      local statusClass = math.floor(entry.status / 100)
+      summary.requests = summary.requests + 1
+      if statusClass == 4 then summary.clientErrors = summary.clientErrors + 1 end
+      if statusClass == 5 then summary.serverErrors = summary.serverErrors + 1 end
+      if entry.durationSeconds then
+        seconds = seconds + entry.durationSeconds
+        summary.durationSamples = summary.durationSamples + 1
+      end
+      if (not exactStatus or entry.status == exactStatus)
+        and (not opts.statusClass or statusClass == opts.statusClass)
+        and matchQuery(q, entry.method, entry.uri, entry.userAgent, entry.host) then
+        entries[#entries + 1] = entry
       end
     end
   end
-  return { entries = entries }
+  if summary.durationSamples > 0 then summary.meanMs = seconds / summary.durationSamples * 1000 end
+  return { entries = entries, summary = summary }
 end
 
 -- Service log lines; access lines are omitted unless opts.includeAccess.
@@ -174,6 +218,9 @@ function M.serviceEntries(unit, lines, opts)
 
   for i = 1, #raw do
     local parsed = M.parseJournalLine(raw[i])
+    -- Older deployed units may still have environment dumps in their journal.
+    local variable = parsed.message:match("^([%a_][%w_]*)=")
+    if variable then parsed.message = variable .. "= [已隐藏]" end
     local access = M.parseAccess(parsed.message)
     if not access then
       if matchQuery(q, parsed.message) then
@@ -207,12 +254,14 @@ local function sanitize(s)
 end
 
 -- Plain-text export for the current journal window.
-function M.exportText(unit, scope, domains, lines, opts)
+function M.exportText(unit, scope, model, lines, opts)
   opts = opts or {}
   local out = {}
   if scope == "site" then
-    local result = M.siteEntries(unit, domains, lines, opts)
-    if result.error then return nil, result.error end
+    local result = M.siteEntries(unit, model, lines, opts)
+    if result.summary.coverage == "unavailable" or (result.summary.coverage == "restricted" and #result.entries == 0) then
+      return nil, { code = "journal_unavailable", message = "无法读取站点访问日志。请检查宿主账号的 Journal 读取权限。" }
+    end
     for _, entry in ipairs(result.entries) do
       out[#out + 1] = table.concat({
         sanitize(entry.time),

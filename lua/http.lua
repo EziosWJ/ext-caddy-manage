@@ -17,7 +17,6 @@ M.codeStatus = {
   not_running = 409,
   not_initialized = 503,
   caddy_missing = 503,
-  grant_missing = 503,
   privilege_missing = 503,
   journal_unavailable = 503,
   service_error = 503,

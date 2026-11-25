@@ -36,6 +36,9 @@ const TITLES = {
 
 function parseRoute(hashValue) {
   let path = String(hashValue || "").replace(/^#/, "");
+  const [pathname, query = ""] = path.split("?", 2);
+  const params = new URLSearchParams(query);
+  path = pathname;
   if (path === "") path = "/overview";
   if (!path.startsWith("/")) path = `/${path}`;
   if (path === "/" || path === "/overview") {
@@ -60,8 +63,9 @@ function parseRoute(hashValue) {
         name: "site",
         view: "site",
         nav: "sites",
-        canonical: `#/sites/${encodeURIComponent(slug)}`,
+        canonical: `#/sites/${encodeURIComponent(slug)}${params.get("section") === "tls" ? "?section=tls" : ""}`,
         slug,
+        section: params.get("section"),
       };
     }
   }
@@ -69,7 +73,12 @@ function parseRoute(hashValue) {
     return { name: "global", view: "global", nav: "global", canonical: "#/global" };
   }
   if (path === "/diagnostics") {
-    return { name: "diagnostics", view: "diagnostics", nav: "diagnostics", canonical: "#/diagnostics" };
+    const selected = params.get("site") || "";
+    const slug = /^[A-Za-z0-9._-]{1,128}$/.test(selected) && !selected.includes("..") ? selected : "";
+    return {
+      name: "diagnostics", view: "diagnostics", nav: "diagnostics", slug,
+      canonical: slug ? `#/diagnostics?site=${encodeURIComponent(slug)}` : "#/diagnostics",
+    };
   }
   return { name: "overview", view: "overview", nav: "overview", canonical: "#/overview", unknown: true };
 }
@@ -282,7 +291,7 @@ async function renderRoute(route) {
   if (focusTarget && typeof focusTarget.focus === "function") {
     focusTarget.focus({ preventScroll: true });
   }
-  window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  window.scrollTo({ top: activeView.scrollTop ?? 0, left: 0, behavior: "auto" });
 }
 
 async function handleNavigation() {
