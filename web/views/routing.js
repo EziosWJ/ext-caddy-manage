@@ -1,4 +1,4 @@
-import { button, chips, dataTable, el, inputField, selectField, switchField, textareaField } from "../components.js";
+import { button, chips, el, icon, inputField, selectField, switchField, textareaField } from "../components.js";
 
 const MATCHES = [{ value: "exact", label: "精确路径" }, { value: "prefix", label: "按段前缀" }];
 const ACTIONS = [
@@ -181,9 +181,11 @@ export function routingEditor(draft, { active, toggle, change, policies }) {
       updateActions();
       for (const [key, input] of Object.entries({ match, path, action, rewrite })) fields[`${field}.${key}`] = input;
 
-      const remove = button("移除规则", {
-        variant: "ghost",
+      const remove = button("移除", {
+        variant: "danger-ghost",
+        icon: "trash",
         compact: true,
+        ariaLabel: `移除路径规则 ${number}`,
         onClick: () => {
           draft.rules.splice(index, 1);
           renderRules();
@@ -192,10 +194,17 @@ export function routingEditor(draft, { active, toggle, change, policies }) {
           changed();
         },
       });
-      ruleList.append(el("fieldset", { class: "ecm-route-rule" },
-        el("legend", null, `路径规则 ${number}`),
-        el("div", { class: "ecm-form-grid" }, match.root, path.root, action.root, rewrite.root, ...pool(rule.proxy, `${field}.proxy`)),
-        remove,
+      ruleList.append(el("div", { class: "ecm-route-rule", role: "group", "aria-label": `路径规则 ${number}` },
+        el("div", { class: "ecm-route-rule-head" },
+          el("span", { class: "ecm-route-rule-title" },
+            el("span", { class: "ecm-route-badge" }, `#${number}`),
+            el("span", null, `路径规则 ${number}`),
+          ),
+          remove,
+        ),
+        el("div", { class: "ecm-route-rule-body" },
+          el("div", { class: "ecm-form-grid" }, match.root, path.root, action.root, rewrite.root, ...pool(rule.proxy, `${field}.proxy`)),
+        ),
       ));
     });
     add.disabled = draft.rules.length >= 20;
@@ -271,15 +280,24 @@ export function routingEditor(draft, { active, toggle, change, policies }) {
         pool: model.fallback.proxy?.upstreams ?? [],
       };
     }
-    preview.replaceChildren(dataTable({
-      label: "请求路由预览",
-      columns: [
-        { key: "branch", label: "命中分支", mono: true },
-        { key: "destination", label: "处理路径", mono: true },
-        { key: "pool", label: "上游", render: (row) => chips(row.pool, { mono: true, limit: 3 }) },
-      ],
-      rows: [route],
-    }));
+    preview.replaceChildren(
+      el("div", { class: "ecm-route-flow", role: "region", "aria-label": "请求路由预览" },
+        el("div", { class: "ecm-route-flow-node" },
+          el("span", { class: "ecm-route-flow-label" }, "命中分支"),
+          el("span", { class: "ecm-chip ecm-chip-info ecm-mono" }, route.branch),
+        ),
+        icon("arrow-right", 15),
+        el("div", { class: "ecm-route-flow-node" },
+          el("span", { class: "ecm-route-flow-label" }, "处理路径"),
+          el("span", { class: "ecm-chip ecm-mono" }, route.destination),
+        ),
+        icon("arrow-right", 15),
+        el("div", { class: "ecm-route-flow-node" },
+          el("span", { class: "ecm-route-flow-label" }, "目标上游"),
+          route.pool.length ? chips(route.pool, { mono: true, limit: 3 }) : el("span", { class: "ecm-hint" }, "—"),
+        ),
+      ),
+    );
   }
 
   renderRules();

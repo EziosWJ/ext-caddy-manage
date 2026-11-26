@@ -27,14 +27,41 @@ export function viewConfiguration(title, content) {
 }
 
 export function configurationToolbar({ raw, canEditForm, view, switchMode }) {
+  const formBtn = el(
+    "button",
+    {
+      class: `ecm-segmented-btn${!raw ? " is-active" : ""}`,
+      type: "button",
+      "aria-pressed": String(!raw),
+      disabled: !canEditForm,
+      onClick: () => {
+        if (raw && canEditForm) switchMode();
+      },
+    },
+    icon("edit", 14),
+    el("span", null, "表单编辑"),
+  );
+  const rawBtn = el(
+    "button",
+    {
+      class: `ecm-segmented-btn${raw ? " is-active" : ""}`,
+      type: "button",
+      "aria-pressed": String(raw),
+      onClick: () => {
+        if (!raw) switchMode();
+      },
+    },
+    icon("file-text", 14),
+    el("span", null, "原文编辑"),
+  );
+  const switcher = canEditForm
+    ? el("div", { class: "ecm-segmented", role: "group", "aria-label": "编辑模式" }, formBtn, rawBtn)
+    : el("span", { class: "ecm-config-mode" }, "原文编辑");
   return el(
     "div", { class: "ecm-config-toolbar" },
-    el("span", { class: "ecm-config-mode" }, raw ? "原文编辑" : "表单编辑"),
+    switcher,
     el("div", { class: "ecm-toolbar" },
       !raw ? button("查看原文", { icon: "eye", variant: "ghost", compact: true, onClick: view }) : null,
-      canEditForm ? button(raw ? "切换到表单" : "编辑原文", {
-        variant: "secondary", compact: true, onClick: switchMode,
-      }) : null,
     ),
   );
 }

@@ -220,6 +220,7 @@ export async function mount(root, ctx, route) {
   let rawEditorInstance = null;
   let refs = {};
   let dirtyIndicator = null;
+  let stickyBar = null;
   let topMessages = null;
   let ui = {};
   let activeTab = "config";
@@ -254,6 +255,7 @@ export async function mount(root, ctx, route) {
   function updateDirty() {
     dirty = Boolean(formDirty() || rawDirty);
     if (dirtyIndicator) dirtyIndicator.hidden = !dirty;
+    if (stickyBar) stickyBar.hidden = !dirty || activeTab !== "config";
   }
 
   // Prevent typing into the form while a request is in flight; otherwise the
@@ -1542,7 +1544,7 @@ export async function mount(root, ctx, route) {
     if (ui.toggleBtn) ui.toggleBtn.disabled = next;
     if (ui.deleteBtn) ui.deleteBtn.disabled = next;
     if (ui.refreshBtn) ui.refreshBtn.disabled = next;
-    for (const control of page.querySelectorAll(".ecm-config-toolbar button, .ecm-file-action")) {
+    for (const control of page.querySelectorAll(".ecm-config-toolbar button, .ecm-file-action, .ecm-sticky-bar button")) {
       control.disabled = next;
     }
     setFormControlsDisabled(next);
@@ -1775,13 +1777,13 @@ export async function mount(root, ctx, route) {
     let deleteBtn = null;
     if (detail.orphan) {
       deleteBtn = button("清理元数据", {
-        variant: "danger",
+        variant: "danger-ghost",
         icon: "trash",
         onClick: () => cleanupOrphan(),
       });
     } else {
       deleteBtn = button("删除", {
-        variant: "danger",
+        variant: "danger-ghost",
         icon: "trash",
         onClick: () => deleteSite(),
       });
@@ -1857,12 +1859,49 @@ export async function mount(root, ctx, route) {
         activeTab = id;
         for (const item of items) item.panel.hidden = item.id !== id;
         if (saveBtn) saveBtn.hidden = id !== "config";
+        if (stickyBar) stickyBar.hidden = !dirty || id !== "config";
         if (id === "logs" && !logPanel.hasChildNodes()) logPanel.append(buildLogsSection());
       },
     });
 
+    stickyBar = saveBtn
+      ? el(
+        "div",
+        { class: "ecm-sticky-bar", hidden: true, role: "region", "aria-label": "未保存更改操作栏" },
+        el(
+          "div",
+          { class: "ecm-sticky-bar-inner" },
+          el(
+            "span",
+            { class: "ecm-sticky-bar-text" },
+            el("span", { class: "ecm-dot ecm-dot-warning", "aria-hidden": "true" }),
+            "有尚未保存的更改",
+          ),
+          el(
+            "div",
+            { class: "ecm-sticky-bar-actions" },
+            button("放弃更改", {
+              variant: "ghost",
+              compact: true,
+              onClick: () => {
+                if (saving) return;
+                initForm();
+                renderPage();
+              },
+            }),
+            button(detail.enabled ? "保存并重载" : "保存", {
+              variant: "primary",
+              icon: "save",
+              compact: true,
+              onClick: () => saveBtn.click(),
+            }),
+          ),
+        ),
+      )
+      : null;
+
     const content = el("div", { class: "ecm-stack" }, topMessages, buildBanners());
-    content.append(navigation.root, ...items.map((item) => item.panel));
+    content.append(navigation.root, ...items.map((item) => item.panel), stickyBar);
 
     page.replaceChildren(header, content);
     updateDirty();

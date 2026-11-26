@@ -2,6 +2,7 @@
 
 import api from "./api.js";
 import { el, icon, errorBlock, banner, linkButton } from "./components.js";
+import { statusLabel, statusTone } from "./format.js";
 import * as overviewView from "./views/overview.js";
 import * as sitesView from "./views/sites.js";
 import * as wizardView from "./views/wizard.js";
@@ -45,7 +46,18 @@ function parseRoute(hashValue) {
     return { name: "overview", view: "overview", nav: "overview", canonical: "#/overview" };
   }
   if (path === "/sites") {
-    return { name: "sites", view: "sites", nav: "sites", canonical: "#/sites" };
+    const allowedStatuses = new Set(["enabled", "disabled", "custom", "orphan", "conflict"]);
+    const rawStatus = params.get("status") || "";
+    const resetFilters = rawStatus === "all";
+    const status = allowedStatuses.has(rawStatus) ? rawStatus : "";
+    return {
+      name: "sites",
+      view: "sites",
+      nav: "sites",
+      status,
+      resetFilters,
+      canonical: status ? `#/sites?status=${encodeURIComponent(status)}` : "#/sites",
+    };
   }
   if (path === "/sites/new") {
     return { name: "newSite", view: "newSite", nav: "sites", canonical: "#/sites/new" };
@@ -108,8 +120,13 @@ function buildShell() {
   const brand = el(
     "a",
     { class: "ecm-brand", href: "#/overview", "aria-label": "Caddy 管理首页" },
-    el("span", { class: "ecm-brand-mark", "aria-hidden": "true" }, icon("shield-check", 20)),
-    el("span", { class: "ecm-brand-text" }, "Caddy 管理"),
+    el("span", { class: "ecm-brand-mark", "aria-hidden": "true" }, icon("gateway", 19)),
+    el(
+      "span",
+      { class: "ecm-brand-copy" },
+      el("span", { class: "ecm-brand-text" }, "Caddy 管理"),
+      el("span", { class: "ecm-brand-sub" }, "Edge Proxy & TLS"),
+    ),
   );
 
   const nav = el("nav", { class: "ecm-nav", "aria-label": "主导航" });
@@ -123,13 +140,33 @@ function buildShell() {
           "data-route": item.id,
           "aria-label": item.label,
         },
-        icon(item.icon, 18),
+        icon(item.icon, 17),
         el("span", { class: "ecm-nav-label" }, item.label),
       ),
     );
   }
 
-  const header = el("header", { class: "ecm-header" }, brand, nav);
+  const statusDot = el("span", { class: "ecm-dot ecm-dot-neutral", "aria-hidden": "true" });
+  const statusTitleText = el("span", null, "检测服务…");
+  const statusMeta = el("span", { class: "ecm-sidebar-status-meta ecm-mono" }, "caddy.service");
+  const sidebarStatus = el(
+    "a",
+    {
+      class: "ecm-sidebar-status",
+      href: "#/overview",
+      "aria-label": "查看 Caddy 服务状态",
+      title: "前往概览查看服务状态",
+    },
+    el(
+      "span",
+      { class: "ecm-sidebar-status-body" },
+      el("span", { class: "ecm-sidebar-status-title" }, statusDot, statusTitleText),
+      statusMeta,
+    ),
+  );
+  const sidebarFooter = el("div", { class: "ecm-sidebar-footer" }, sidebarStatus);
+
+  const header = el("header", { class: "ecm-header" }, brand, nav, sidebarFooter);
   const bannerHost = el("div", {
     class: "ecm-global-banner ecm-container",
     id: "ecm-global-banner",
@@ -139,12 +176,31 @@ function buildShell() {
   const main = el("main", { class: "ecm-main", id: "ecm-main", tabindex: "-1" }, bannerHost, viewRoot);
   const shell = el("div", { class: "ecm-shell" }, header, main);
   app.replaceChildren(skip, shell);
-  return { app, viewRoot, bannerHost };
+  return { app, viewRoot, bannerHost, statusDot, statusTitleText, statusMeta };
 }
 
 const shell = buildShell();
 const routeRoot = shell ? shell.viewRoot : null;
 const bannerHost = shell ? shell.bannerHost : null;
+
+function updateServicePulse(service) {
+  if (!shell || !service) return;
+  const state = service.state || (service.running ? "running" : "unknown");
+  const tone = service.error ? "warning" : statusTone(state);
+  const running = Boolean(service.running) && !service.error;
+  shell.statusDot.className = `ecm-dot ecm-dot-${tone}${running ? " ecm-dot-pulse" : ""}`;
+  shell.statusTitleText.textContent = service.error ? "状态未知" : `Caddy ${statusLabel(state)}`;
+  if (service.unit) shell.statusMeta.textContent = service.unit;
+}
+
+async function fetchServicePulse() {
+  try {
+    const svc = await api.service();
+    updateServicePulse(svc);
+  } catch {
+    // Keep neutral status when service probe is unavailable.
+  }
+}
 
 function renderHealthBanner(health) {
   if (!bannerHost) return;
@@ -246,6 +302,7 @@ async function renderRoute(route) {
     navigate,
     signal: controller.signal,
     refreshHealth: () => checkHealthBanner(),
+    updateServiceStatus: (service) => updateServicePulse(service),
     setTitle: (text) => {
       if (seq === renderSeq) {
         document.title = text ? `${text} · Caddy 管理` : titleFor(route);
@@ -362,6 +419,7 @@ if (routeRoot) {
       // Ignore.
     }
   }
+  fetchServicePulse();
   renderRoute(initial).catch((error) => {
     routeRoot.replaceChildren(errorBlock(error, { title: "应用初始化失败" }));
   });

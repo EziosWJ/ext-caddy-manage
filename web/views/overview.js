@@ -77,16 +77,27 @@ function scopeLabel(scope) {
 }
 
 export async function mount(root, ctx) {
-  const refreshBtn = button("刷新", { variant: "primary", icon: "refresh-cw", onClick: () => load() });
+  const refreshBtn = button("", {
+    variant: "ghost",
+    icon: "refresh-cw",
+    compact: true,
+    ariaLabel: "刷新概览",
+    title: "刷新",
+    onClick: () => load(),
+  });
   const logBtn = button("服务日志", {
     variant: "secondary",
     icon: "terminal",
     onClick: () => openLogDrawer(),
   });
+  const newSiteBtn = linkButton("新建站点", "#/sites/new", {
+    variant: "primary",
+    icon: "plus",
+  });
 
   const header = pageHeader({
     title: "概览",
-    actions: [refreshBtn, logBtn],
+    actions: [refreshBtn, logBtn, newSiteBtn],
   });
   const content = el("div", { class: "ecm-stack" });
   root.append(el("div", { class: "ecm-page" }, header, content));
@@ -130,12 +141,14 @@ export async function mount(root, ctx) {
       ]));
     }
     if (!snapshot.handlers) return;
-    snapshotBody.append(
-      el("h3", null, "HTTP 处理器"),
+    const handlersBlock = el(
+      "div",
+      { class: "ecm-snapshot-sub" },
+      el("h3", { class: "ecm-subtitle" }, "HTTP 处理器"),
       el("p", { class: "ecm-hint" }, "按 Caddy server 与 handler 汇总累计样本。同一请求可能经过多个处理器。平均耗时和 HTTP 5xx 来自响应耗时样本，中间件错误来自单独的计数器。"),
     );
     if (snapshot.handlers.length) {
-      snapshotBody.append(dataTable({
+      handlersBlock.append(dataTable({
         label: "HTTP 处理器指标",
         columns: [
           { key: "server", label: "Server", mono: true },
@@ -148,22 +161,30 @@ export async function mount(root, ctx) {
         rows: snapshot.handlers,
       }));
     } else {
-      snapshotBody.append(el("p", { class: "ecm-hint" }, "暂无 HTTP 处理器样本。可在全局配置中确认已启用 metrics，并访问站点后重新采集。"));
+      handlersBlock.append(el("p", { class: "ecm-hint" }, "暂无 HTTP 处理器样本。可在全局配置中确认已启用 metrics，并访问站点后重新采集。"));
     }
-    snapshotBody.append(
-      el("h3", null, "上游状态"),
+    snapshotBody.append(handlersBlock);
+
+    const upstreamsBlock = el(
+      "div",
+      { class: "ecm-snapshot-sub" },
+      el("h3", { class: "ecm-subtitle" }, "上游状态"),
       el("p", { class: "ecm-hint" }, "Caddy 报告可选的上游仍需单独确认连通。"),
     );
     if (!snapshot.upstreams.length) {
-      snapshotBody.append(el("p", { class: "ecm-hint" }, "没有上游健康样本。可在站点诊断中检查上游连通。"));
+      upstreamsBlock.append(el("p", { class: "ecm-hint" }, "没有上游健康样本。可在站点诊断中检查上游连通。"));
+    } else {
+      const grid = el("div", { class: "ecm-upstream-grid" });
+      for (const upstream of snapshot.upstreams) {
+        const unhealthy = upstream.status === "unhealthy";
+        grid.append(el("div", { class: "ecm-upstream-pill" },
+          el("code", { class: "ecm-mono" }, upstream.address),
+          badge(unhealthy ? "Caddy 报告不健康" : "Caddy 可选 · 连通未验证", unhealthy ? "warning" : "neutral", { dot: true }),
+        ));
+      }
+      upstreamsBlock.append(grid);
     }
-    for (const upstream of snapshot.upstreams) {
-      const unhealthy = upstream.status === "unhealthy";
-      snapshotBody.append(el("div", { class: "ecm-inline ecm-wrap" },
-        el("code", { class: "ecm-mono" }, upstream.address),
-        badge(unhealthy ? "Caddy 报告不健康" : "Caddy 可选 · 连通未验证", unhealthy ? "warning" : "neutral"),
-      ));
-    }
+    snapshotBody.append(upstreamsBlock);
   }
 
   let snapshotLoading = false;
@@ -264,78 +285,123 @@ export async function mount(root, ctx) {
     const svc = service || {};
     const available = svc.available !== false && !svc.error;
     const running = Boolean(svc.running);
+    const tone = svc.error ? "warning" : statusTone(svc.state);
     const unitDetails = [svc.fragmentPath, svc.stateDetail].filter(Boolean).join("\n");
-    const card = section({
-      title: "服务状态",
-      actions: [
-        badge(statusLabel(svc.state), statusTone(svc.state), { dot: true }),
-        el("span", { class: "ecm-chip ecm-mono" }, svc.unit || "caddy.service"),
-        unitDetails ? helpTip(unitDetails, "服务单元") : null,
-      ],
-      children: [],
-    });
-
-    const body = card.querySelector(".ecm-card-body");
-
-    if (svc.error) {
-      body.append(
-        feedback(svc.error.message || "服务状态不可用", "warning", {
-          action: linkButton("前往诊断", "#/diagnostics", { variant: "secondary", compact: true }),
-        }),
-      );
-    }
-
-    body.append(
-      metaGrid([
-        { label: "Caddy 版本", value: (data && data.caddyVersion) || "未检测", mono: true },
-        {
-          label: "启动时间",
-          value: svc.activeEnterTimestamp ? fmtDateTime(svc.activeEnterTimestamp, { seconds: true }) : "—",
-          title: svc.activeEnterTimestamp ? fmtRelative(svc.activeEnterTimestamp) : "",
-        },
-        { label: "主进程 PID", value: svc.mainPid || "—", mono: true },
-        { label: "内存占用", value: fmtBytes(svc.memoryBytes) },
-        { label: "CPU 时间", value: fmtCpuTime(svc.cpuUsageNs) },
-        { label: "开机启动", value: bootStateLabel(svc.bootState) },
-      ]),
-    );
-
-    if (svc.error && svc.error.code) {
-      body.append(el("p", { class: "ecm-hint" }, `错误码：${svc.error.code}`));
-    }
 
     const startBtn = button("启动", {
-      variant: "secondary",
+      variant: running ? "secondary" : "primary",
       icon: "play",
+      compact: true,
       disabled: !available || running,
       onClick: () => runServiceAction("start", startBtn),
     });
-    const stopBtn = button("停止", {
-      variant: "secondary",
-      icon: "square",
+    const reloadBtn = button("重载配置", {
+      variant: running ? "soft" : "secondary",
+      icon: "zap",
+      compact: true,
       disabled: !available || !running,
-      onClick: () => runServiceAction("stop", stopBtn),
+      title: "校验主配置并让 Caddy 无缝重载",
+      onClick: () => runServiceAction("reload", reloadBtn),
     });
     const restartBtn = button("重启", {
-      variant: "secondary",
+      variant: "ghost",
       icon: "rotate-cw",
+      compact: true,
       disabled: !available,
       onClick: () => runServiceAction("restart", restartBtn),
     });
-    const reloadBtn = button("重载", {
-      variant: "secondary",
-      icon: "zap",
+    const stopBtn = button("停止", {
+      variant: "danger-ghost",
+      icon: "square",
+      compact: true,
       disabled: !available || !running,
-      title: "校验主配置并让 Caddy 重载",
-      onClick: () => runServiceAction("reload", reloadBtn),
+      onClick: () => runServiceAction("stop", stopBtn),
     });
-    body.append(el(
+
+    const hero = el("section", { class: `ecm-hero-card is-${tone}` });
+    const top = el(
       "div",
-      { class: "ecm-toolbar ecm-service-actions" },
-      el("div", { class: "ecm-service-action-group", role: "group", "aria-label": "启动与重载" }, startBtn, reloadBtn),
-      el("div", { class: "ecm-service-action-group", role: "group", "aria-label": "会中断服务的操作" }, restartBtn, stopBtn),
-    ));
-    return card;
+      { class: "ecm-hero-top" },
+      el(
+        "div",
+        { class: "ecm-hero-identity" },
+        el("div", { class: "ecm-hero-emblem", "aria-hidden": "true" }, icon("server", 21)),
+        el(
+          "div",
+          { class: "ecm-hero-title-group" },
+          el(
+            "div",
+            { class: "ecm-hero-title-row" },
+            el("h2", { class: "ecm-hero-title" }, "Caddy 服务"),
+            badge(statusLabel(svc.state), tone, { dot: true, pulse: running && !svc.error }),
+            (data && data.caddyVersion)
+              ? el("span", { class: "ecm-chip ecm-mono" }, data.caddyVersion)
+              : null,
+          ),
+          el(
+            "div",
+            { class: "ecm-hero-sub" },
+            el("span", { class: "ecm-mono" }, svc.unit || "caddy.service"),
+            svc.activeEnterTimestamp
+              ? el("span", { title: fmtDateTime(svc.activeEnterTimestamp, { seconds: true }) }, `运行始于 ${fmtRelative(svc.activeEnterTimestamp)}`)
+              : null,
+            unitDetails ? helpTip(unitDetails, "服务单元") : null,
+          ),
+        ),
+      ),
+      el(
+        "div",
+        { class: "ecm-hero-actions" },
+        el("div", { class: "ecm-service-action-group", role: "group", "aria-label": "启动与重载" },
+          running ? reloadBtn : startBtn,
+          running ? null : reloadBtn,
+        ),
+        el("div", { class: "ecm-service-action-group", role: "group", "aria-label": "会中断服务的操作" },
+          restartBtn,
+          stopBtn,
+        ),
+      ),
+    );
+    hero.append(top);
+
+    if (svc.error) {
+      hero.append(
+        el(
+          "div",
+          { class: "ecm-hero-notice" },
+          feedback(
+            svc.error.code ? `${svc.error.message || "服务状态不可用"}（${svc.error.code}）` : (svc.error.message || "服务状态不可用"),
+            "warning",
+            { action: linkButton("前往诊断", "#/diagnostics", { variant: "secondary", compact: true }) },
+          ),
+        ),
+      );
+    }
+
+    const metrics = [
+      {
+        label: "启动时间",
+        value: svc.activeEnterTimestamp ? fmtDateTime(svc.activeEnterTimestamp, { seconds: true }) : "—",
+        title: svc.activeEnterTimestamp ? fmtRelative(svc.activeEnterTimestamp) : "",
+      },
+      { label: "主进程 PID", value: svc.mainPid || "—", mono: true },
+      { label: "内存占用", value: fmtBytes(svc.memoryBytes) },
+      { label: "CPU 时间", value: fmtCpuTime(svc.cpuUsageNs) },
+      { label: "开机启动", value: bootStateLabel(svc.bootState) },
+    ];
+    const strip = el("div", { class: "ecm-hero-metrics" });
+    for (const item of metrics) {
+      strip.append(
+        el(
+          "div",
+          { class: "ecm-hero-metric" },
+          el("span", { class: "ecm-meta-label" }, item.label),
+          el("span", { class: `ecm-meta-value${item.mono ? " ecm-mono" : ""}`, title: item.title || undefined }, String(item.value)),
+        ),
+      );
+    }
+    hero.append(strip);
+    return hero;
   }
 
   function renderCerts(overview) {
@@ -396,10 +462,21 @@ export async function mount(root, ctx) {
             key: "days",
             label: "剩余",
             align: "right",
-            render: (row) =>
-              badge(fmtDays(row.days), certTone(row.days, row.error), {
-                title: row.error || (row.checked_at ? `探测于 ${fmtDateTime(row.checked_at)}` : ""),
-              }),
+            render: (row) => {
+              const tone = certTone(row.days, row.error);
+              const pct = Number.isFinite(Number(row.days)) ? Math.max(4, Math.min(100, Math.round((Number(row.days) / 90) * 100))) : 0;
+              return el(
+                "div",
+                { class: "ecm-cert-cell" },
+                badge(fmtDays(row.days), tone, {
+                  title: row.error || (row.checked_at ? `探测于 ${fmtDateTime(row.checked_at)}` : ""),
+                }),
+                pct > 0
+                  ? el("span", { class: "ecm-cert-bar", "aria-hidden": "true" },
+                    el("span", { class: `ecm-cert-bar-fill is-${tone}`, style: { width: `${pct}%` } }))
+                  : null,
+              );
+            },
           },
           {
             key: "checked_at",
@@ -456,27 +533,38 @@ export async function mount(root, ctx) {
     return card;
   }
 
+  function kpiCard({ label, value, tone = "neutral", icon: iconName, href }) {
+    return el(
+      "a",
+      { class: `ecm-kpi-card is-${tone}`, href },
+      el(
+        "div",
+        { class: "ecm-kpi-head" },
+        el("span", null, label),
+        el("span", { class: "ecm-kpi-icon", "aria-hidden": "true" }, icon(iconName, 15)),
+      ),
+      el("div", { class: "ecm-kpi-value ecm-num" }, String(value ?? 0)),
+    );
+  }
+
   function render() {
     if (!data || destroyed) return;
     content.replaceChildren();
-
-
-    content.append(renderService(data.service), snapshotCard);
+    ctx.updateServiceStatus?.(data.service);
 
     const sites = data.sites || {};
-    const tiles = el("div", { class: "ecm-tiles" });
-    tiles.append(
-      statTile({ label: "站点总数", value: sites.total ?? 0, icon: "globe" }),
-      statTile({ label: "已启用", value: sites.enabled ?? 0, tone: "success", icon: "check-circle" }),
-      statTile({ label: "已停用", value: sites.disabled ?? 0, icon: "square" }),
-      statTile({ label: "自定义片段", value: sites.custom ?? 0, tone: "info", icon: "file-text" }),
-      statTile({ label: "孤儿记录", value: sites.orphan ?? 0, tone: (sites.orphan || 0) > 0 ? "warning" : "neutral", icon: "database" }),
+    const kpiStrip = el(
+      "div",
+      { class: "ecm-kpi-strip", role: "region", "aria-label": "站点规模统计" },
+      kpiCard({ label: "站点总数", value: sites.total ?? 0, icon: "globe", href: "#/sites?status=all" }),
+      kpiCard({ label: "已启用", value: sites.enabled ?? 0, tone: "success", icon: "check-circle", href: "#/sites?status=enabled" }),
+      kpiCard({ label: "已停用", value: sites.disabled ?? 0, tone: "neutral", icon: "square", href: "#/sites?status=disabled" }),
+      kpiCard({ label: "自定义片段", value: sites.custom ?? 0, tone: "info", icon: "file-text", href: "#/sites?status=custom" }),
+      kpiCard({ label: "孤儿记录", value: sites.orphan ?? 0, tone: (sites.orphan || 0) > 0 ? "warning" : "neutral", icon: "database", href: "#/sites?status=orphan" }),
     );
-    content.append(section({ title: "站点规模", children: tiles }));
 
-    const grid = el("div", { class: "ecm-overview-grid" });
-    grid.append(renderCerts(data), renderErrors(data));
-    content.append(grid);
+    const grid = el("div", { class: "ecm-overview-grid" }, renderCerts(data), renderErrors(data));
+    content.append(renderService(data.service), kpiStrip, grid, snapshotCard);
   }
 
   async function load(opts = {}) {

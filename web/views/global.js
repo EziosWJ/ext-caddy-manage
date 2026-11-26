@@ -58,6 +58,7 @@ export async function mount(root, ctx) {
   let destroyed = false;
   let topMessages = null;
   let dirtyIndicator = null;
+  let stickyBar = null;
   let refs = {};
   let ui = {};
   let rawEditorInstance = null;
@@ -79,6 +80,7 @@ export async function mount(root, ctx) {
   function updateDirty() {
     dirty = Boolean(formDirty() || rawDirty);
     if (dirtyIndicator) dirtyIndicator.hidden = !dirty;
+    if (stickyBar) stickyBar.hidden = !dirty || activeTab !== "config";
   }
 
   function setFormControlsDisabled(next) {
@@ -150,14 +152,14 @@ export async function mount(root, ctx) {
 
   function renderLoadError(error) {
     page.replaceChildren(
-      pageHeader({ title: "全局配置", backHref: "#/overview", backLabel: "概览" }),
+      pageHeader({ title: "全局配置" }),
       errorBlock(error, { title: "全局配置加载失败", onRetry: () => load() }),
     );
   }
 
   async function load() {
     page.replaceChildren(
-      pageHeader({ title: "全局配置", backHref: "#/overview", backLabel: "概览" }),
+      pageHeader({ title: "全局配置" }),
       el("div", { class: "ecm-stack" }, loadingBlock("正在读取全局配置…")),
     );
     try {
@@ -230,11 +232,10 @@ export async function mount(root, ctx) {
       children: el("div", { class: "ecm-stack" },
         el("p", { class: "ecm-hint" }, "公网域名的 HTTPS 由各站点设置，Caddy 会自动申请和续期。"),
         stagingWarning,
-        el("details", { class: "ecm-details" },
-          el("summary", null, "高级设置"),
-          el("div", { class: "ecm-form-grid ecm-details-body" },
-            emailField.root, stagingField.root, extraField.root, extraCount,
-          ),
+        el("div", { class: "ecm-form-grid" }, emailField.root, stagingField.root),
+        el("details", { class: "ecm-details", open: Boolean(gform.extra.trim()) },
+          el("summary", null, "额外全局指令"),
+          el("div", { class: "ecm-stack ecm-details-body" }, extraField.root, extraCount),
         ),
       ),
     });
@@ -294,7 +295,7 @@ export async function mount(root, ctx) {
       rawEditorInstance?.setDisabled(next);
     }
     if (ui.refreshBtn) ui.refreshBtn.disabled = next;
-    for (const control of page.querySelectorAll(".ecm-config-toolbar button, .ecm-file-action")) {
+    for (const control of page.querySelectorAll(".ecm-config-toolbar button, .ecm-file-action, .ecm-sticky-bar button")) {
       control.disabled = next;
     }
     setFormControlsDisabled(next);
@@ -577,10 +578,44 @@ export async function mount(root, ctx) {
         activeTab = id;
         for (const item of items) item.panel.hidden = item.id !== id;
         saveBtn.hidden = id !== "config";
+        if (stickyBar) stickyBar.hidden = !dirty || id !== "config";
       },
     });
+    stickyBar = el(
+      "div",
+      { class: "ecm-sticky-bar", hidden: true, role: "region", "aria-label": "未保存更改操作栏" },
+      el(
+        "div",
+        { class: "ecm-sticky-bar-inner" },
+        el(
+          "span",
+          { class: "ecm-sticky-bar-text" },
+          el("span", { class: "ecm-dot ecm-dot-warning", "aria-hidden": "true" }),
+          "全局配置有未保存的更改",
+        ),
+        el(
+          "div",
+          { class: "ecm-sticky-bar-actions" },
+          button("放弃更改", {
+            variant: "ghost",
+            compact: true,
+            onClick: () => {
+              if (saving) return;
+              initState();
+              render();
+            },
+          }),
+          button("保存并重载", {
+            variant: "primary",
+            icon: "save",
+            compact: true,
+            onClick: () => saveBtn.click(),
+          }),
+        ),
+      ),
+    );
     const content = el("div", { class: "ecm-stack" },
-      topMessages, buildBanners(), navigation.root, items.map((item) => item.panel));
+      topMessages, buildBanners(), navigation.root, items.map((item) => item.panel), stickyBar);
 
     page.replaceChildren(header, content);
     updateDirty();

@@ -290,6 +290,11 @@ const ICONS = {
       },
     ],
   ],
+  gateway: [
+    ["rect", { x: "3", y: "11", width: "18", height: "10", rx: "2.5" }],
+    ["path", { d: "M7.5 11V7.5a4.5 4.5 0 0 1 9 0V11" }],
+    ["circle", { cx: "12", cy: "16", r: "1.5" }],
+  ],
   circle: [["circle", { cx: "12", cy: "12", r: "10" }]],
 };
 
@@ -434,9 +439,9 @@ export function button(label, opts = {}) {
       "aria-label": ariaLabel || (label ? undefined : iconName || "操作"),
       "aria-busy": loading ? "true" : undefined,
     },
-    loading ? spinner(14) : iconName ? icon(iconName, iconSize || (compact ? 16 : 20)) : null,
-    label ? el("span", { class: "ecm-btn-label" }, label) : null,
-  );
+      loading ? spinner(14) : iconName ? icon(iconName, iconSize || (compact ? 15 : 16)) : null,
+      label ? el("span", { class: "ecm-btn-label" }, label) : null,
+    );
   if (onClick) btn.addEventListener("click", onClick);
   return btn;
 }
@@ -449,7 +454,7 @@ export function linkButton(label, href, opts = {}) {
   return el(
     "a",
     { class: classes.join(" "), href, title },
-    iconName ? icon(iconName, compact ? 16 : 20) : null,
+    iconName ? icon(iconName, compact ? 15 : 16) : null,
     el("span", { class: "ecm-btn-label" }, label),
   );
 }
@@ -475,13 +480,153 @@ export function buttonBusy(btn, busy, busyLabel = "处理中…") {
 }
 
 export function badge(text, tone = "neutral", opts = {}) {
+  const dotClass = `ecm-dot ecm-dot-${tone}${opts.pulse ? " ecm-dot-pulse" : ""}`;
   const node = el(
     "span",
     { class: `ecm-badge ecm-badge-${tone}`, title: opts.title },
-    opts.dot ? el("span", { class: `ecm-dot ecm-dot-${tone}`, "aria-hidden": "true" }) : null,
+    opts.dot ? el("span", { class: dotClass, "aria-hidden": "true" }) : null,
     el("span", { class: "ecm-badge-text" }, text),
   );
   return node;
+}
+
+let activeMenu = null;
+
+function closeActiveMenu(restoreFocus = false) {
+  if (!activeMenu) return;
+  const { root, trigger, popover } = activeMenu;
+  activeMenu = null;
+  popover.hidden = true;
+  if (popover.parentNode === document.body) popover.remove();
+  root.classList.remove("is-open");
+  trigger.setAttribute("aria-expanded", "false");
+  if (restoreFocus && trigger.isConnected) trigger.focus();
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (
+    activeMenu &&
+    !activeMenu.root.contains(event.target) &&
+    !activeMenu.popover.contains(event.target)
+  ) {
+    closeActiveMenu(false);
+  }
+});
+
+window.addEventListener("scroll", () => {
+  if (activeMenu) closeActiveMenu(false);
+}, { capture: true, passive: true });
+
+window.addEventListener("resize", () => {
+  if (activeMenu) closeActiveMenu(false);
+}, { passive: true });
+
+window.addEventListener("hashchange", () => {
+  if (activeMenu) closeActiveMenu(false);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activeMenu) {
+    event.preventDefault();
+    event.stopPropagation();
+    closeActiveMenu(true);
+  }
+}, true);
+
+/** Floating popover action menu portaled to body so table containers never scroll or clip it. */
+export function actionMenu({ ariaLabel = "更多操作", items = [] } = {}) {
+  const menuId = uid("menu");
+  const trigger = button("", {
+    variant: "ghost",
+    icon: "more-horizontal",
+    compact: true,
+    ariaLabel,
+    title: ariaLabel,
+  });
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-controls", menuId);
+
+  const popover = el("div", {
+    class: "ecm-menu-popover",
+    id: menuId,
+    role: "menu",
+    hidden: true,
+  });
+
+  for (const item of items) {
+    if (!item) continue;
+    if (item.divider) {
+      popover.append(el("div", { class: "ecm-menu-divider", role: "separator" }));
+      continue;
+    }
+    const cls = `ecm-menu-item${item.danger ? " ecm-menu-item-danger" : ""}`;
+    if (item.href) {
+      const link = el(
+        "a",
+        {
+          class: cls,
+          role: "menuitem",
+          href: item.href,
+          target: item.external ? "_blank" : undefined,
+          rel: item.external ? "noopener noreferrer" : undefined,
+        },
+        item.icon ? icon(item.icon, 15) : null,
+        el("span", null, item.label),
+      );
+      link.addEventListener("click", () => closeActiveMenu(false));
+      popover.append(link);
+    } else {
+      const btn = el(
+        "button",
+        {
+          class: cls,
+          type: "button",
+          role: "menuitem",
+          disabled: Boolean(item.disabled),
+        },
+        item.icon ? icon(item.icon, 15) : null,
+        el("span", null, item.label),
+      );
+      btn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        closeActiveMenu(false);
+        if (item.onClick) item.onClick();
+      });
+      popover.append(btn);
+    }
+  }
+
+  const root = el("div", { class: "ecm-menu" }, trigger);
+  trigger.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const isSame = activeMenu && activeMenu.root === root;
+    closeActiveMenu(false);
+    if (isSame) return;
+
+    popover.hidden = false;
+    popover.style.top = "-9999px";
+    popover.style.left = "-9999px";
+    document.body.append(popover);
+
+    const triggerRect = trigger.getBoundingClientRect();
+    const popRect = popover.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const left = Math.max(8, Math.min(triggerRect.right - popRect.width, vw - popRect.width - 8));
+    const spaceBelow = vh - triggerRect.bottom - 10;
+    const openAbove = spaceBelow < popRect.height && triggerRect.top - 10 >= popRect.height;
+    const top = openAbove
+      ? Math.max(8, triggerRect.top - popRect.height - 6)
+      : Math.min(vh - popRect.height - 8, triggerRect.bottom + 6);
+
+    popover.style.left = `${Math.round(left)}px`;
+    popover.style.top = `${Math.round(top)}px`;
+    root.classList.add("is-open");
+    trigger.setAttribute("aria-expanded", "true");
+    activeMenu = { root, trigger, popover };
+  });
+  return root;
 }
 
 function toneIcon(tone) {
@@ -1533,14 +1678,29 @@ export function rawEditor(opts = {}) {
     el("div", { class: "ecm-editor-actions" }, counter, saveInHeader ? null : saveBtn),
   );
 
+  const gutter = el("pre", { class: "ecm-code-gutter", "aria-hidden": "true" });
+  const updateGutter = () => {
+    const linesCount = Math.max(18, current.split("\n").length);
+    const nums = [];
+    for (let i = 1; i <= linesCount; i += 1) nums.push(String(i));
+    gutter.textContent = nums.join("\n");
+  };
+  textarea.addEventListener("scroll", () => {
+    gutter.scrollTop = textarea.scrollTop;
+  });
+
+  const codeBody = el("div", { class: "ecm-code-body" }, gutter, textarea);
+  const frame = el("div", { class: "ecm-code-frame" }, toolbar, codeBody);
+
   const root = el("div", { class: "ecm-raw-editor" });
   if (disabledState && disabledReason) root.append(feedback(disabledReason, "warning"));
-  root.append(toolbar, textarea, statusArea);
+  root.append(frame, statusArea);
 
   const updateCounter = () => {
     const bytes = byteLength(current);
     counter.textContent = `${fmtBytes(bytes)} / ${fmtBytes(maxBytes)}`;
     counter.classList.toggle("ecm-tone-danger", bytes > maxBytes);
+    updateGutter();
   };
 
   const setDirty = (next) => {
@@ -1873,7 +2033,9 @@ export function logViewer(opts = {}) {
     statusEl,
   );
 
-  const summary = scope === "site" ? el("div", { class: "ecm-stack" }, el("h3", null, "近期访问摘要")) : null;
+  const summary = scope === "site"
+    ? el("div", { class: "ecm-stack ecm-log-summary" }, el("h3", { class: "ecm-subtitle" }, "近期访问摘要"))
+    : null;
   const root = el("div", { class: "ecm-log" }, summary, controls, output);
 
   let lastSummary;
@@ -1911,7 +2073,7 @@ export function logViewer(opts = {}) {
     const retryable = data.coverage === "unavailable" || (data.coverage === "restricted" && !data.journalLines);
     const unavailable = retryable || data.coverage === "unsupported";
     summary.replaceChildren(
-      el("h3", null, "近期访问摘要"),
+      el("h3", { class: "ecm-subtitle" }, "近期访问摘要"),
       el("p", { class: "ecm-hint" },
         `${windowText} · ${data.journalLines || 0} / ${data.requestedLines} 行 · ${coverage}`),
       retryable ? button("重试日志读取", { compact: true, icon: "refresh-cw", onClick: () => refreshNow(true) }) : null,
@@ -2022,6 +2184,11 @@ export function logViewer(opts = {}) {
       const tbody = el("tbody");
       for (const entry of state.entries) {
         const status = Number(entry.status) || 0;
+        const method = String(entry.method || "—").toUpperCase();
+        const methodTone = ["GET", "HEAD"].includes(method) ? "ecm-method-get"
+          : method === "POST" ? "ecm-method-post"
+            : ["PUT", "PATCH"].includes(method) ? "ecm-method-put"
+              : method === "DELETE" ? "ecm-method-delete" : "";
         tbody.append(
           el(
             "tr",
@@ -2031,7 +2198,7 @@ export function logViewer(opts = {}) {
             el(
               "td",
               { class: "ecm-mono ecm-log-request" },
-              el("span", { class: "ecm-log-method" }, entry.method || "—"),
+              el("span", { class: `ecm-log-method${methodTone ? ` ${methodTone}` : ""}` }, entry.method || "—"),
               el("span", { class: "ecm-log-uri", title: entry.uri || "" }, entry.uri || ""),
             ),
             showHost ? el("td", { class: "ecm-mono" }, entry.host || "—") : null,

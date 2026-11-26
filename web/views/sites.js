@@ -1,5 +1,6 @@
 import api from "../api.js";
 import {
+  actionMenu,
   badge,
   button,
   buttonBusy,
@@ -49,13 +50,16 @@ function makeSelect(options, ariaLabel) {
 
 let previousList = null;
 
-export async function mount(root, ctx) {
-  const previous = previousList;
+export async function mount(root, ctx, route) {
+  const previous = route?.resetFilters ? null : previousList;
+  const routeStatus = route && route.status ? route.status : "";
   const state = {
     items: [],
     groups: [],
     warnings: [],
-    filters: previous?.filters || { q: "", type: "", status: "", group: "" },
+    filters: routeStatus
+      ? { q: "", type: "", status: routeStatus, group: "" }
+      : (previous?.filters || { q: "", type: "", status: "", group: "" }),
     selected: new Set(),
     loading: true,
     error: null,
@@ -63,7 +67,14 @@ export async function mount(root, ctx) {
     destroyed: false,
   };
 
-  const refreshBtn = button("刷新", { variant: "secondary", icon: "refresh-cw", onClick: () => load() });
+  const refreshBtn = button("", {
+    variant: "ghost",
+    icon: "refresh-cw",
+    compact: true,
+    ariaLabel: "刷新站点列表",
+    title: "刷新",
+    onClick: () => load(),
+  });
   const newBtn = button("新建站点", {
     variant: "primary",
     icon: "plus",
@@ -87,7 +98,7 @@ export async function mount(root, ctx) {
   const typeSelect = makeSelect(TYPE_OPTIONS, "类型筛选");
   const statusSelect = makeSelect(STATUS_OPTIONS, "状态筛选");
   const groupSelect = makeSelect([{ value: "", label: "全部分组" }], "分组筛选");
-  searchInput.value = previous?.search || "";
+  searchInput.value = routeStatus ? "" : (previous?.search || "");
   typeSelect.value = state.filters.type;
   statusSelect.value = state.filters.status;
   const resetBtn = button("清除筛选", {
@@ -140,7 +151,8 @@ export async function mount(root, ctx) {
 
   const results = el("div", { class: "ecm-sites-results" });
   const scanNotice = el("div", { class: "ecm-scan-notice" });
-  const content = el("div", { class: "ecm-stack" }, filterbar, scanNotice, messages, batchBar, results);
+  const tableShell = el("div", { class: "ecm-table-card" }, filterbar, results);
+  const content = el("div", { class: "ecm-stack" }, scanNotice, messages, batchBar, tableShell);
   root.append(el("div", { class: "ecm-page" }, header, content));
 
   let searchTimer = null;
@@ -286,7 +298,7 @@ export async function mount(root, ctx) {
     if (item.orphan) {
       wrap.append(
         button("清理元数据", {
-          variant: "ghost",
+          variant: "danger-ghost",
           icon: "trash",
           compact: true,
           ariaLabel: `清理孤儿记录 ${item.name}`,
@@ -298,23 +310,50 @@ export async function mount(root, ctx) {
     }
     const url = item.enabled && !item.conflict && item.urls?.[0];
     if (url) {
-      wrap.append(el("a", { class: "ecm-link", href: url, target: "_blank", rel: "noopener noreferrer" }, "打开站点"));
+      wrap.append(
+        el(
+          "a",
+          {
+            class: "ecm-btn ecm-btn-ghost ecm-btn-compact ecm-btn-icon-only",
+            href: url,
+            target: "_blank",
+            rel: "noopener noreferrer",
+            title: `打开 ${url}`,
+            "aria-label": `打开站点 ${item.name}`,
+          },
+          icon("external-link", 15),
+        ),
+      );
     }
-    const actions = el("div", { class: "ecm-toolbar" },
-      button(item.enabled ? "停用" : "启用", {
-        variant: "ghost",
-        icon: item.enabled ? "square" : "play",
-        compact: true,
-        onClick: () => toggleSite(item),
-      }),
-      button("删除", {
-        variant: "ghost",
-        icon: "trash",
-        compact: true,
-        onClick: () => deleteItem(item),
+    wrap.append(
+      actionMenu({
+        ariaLabel: `站点 ${item.name} 更多操作`,
+        items: [
+          {
+            label: "管理配置",
+            icon: "edit",
+            href: `#/sites/${encodeURIComponent(item.slug)}`,
+          },
+          {
+            label: "链路检查",
+            icon: "activity",
+            href: `#/diagnostics?site=${encodeURIComponent(item.slug)}`,
+          },
+          { divider: true },
+          {
+            label: item.enabled ? "停用站点" : "启用站点",
+            icon: item.enabled ? "square" : "play",
+            onClick: () => toggleSite(item),
+          },
+          {
+            label: "删除站点",
+            icon: "trash",
+            danger: true,
+            onClick: () => deleteItem(item),
+          },
+        ],
       }),
     );
-    wrap.append(el("details", { class: "ecm-site-actions" }, el("summary", null, "更多操作"), actions));
     return wrap;
   }
 
@@ -514,10 +553,17 @@ export async function mount(root, ctx) {
       }
     });
 
+    const selectAllLabel = el(
+      "label",
+      { class: "ecm-check ecm-check-tight" },
+      selectAllBox,
+      el("span", { class: "ecm-check-box", "aria-hidden": "true" }, icon("check", 12)),
+    );
+
     const columns = [
       {
         key: "select",
-        label: selectAllBox,
+        label: selectAllLabel,
         width: "40px",
         render: (item) => {
           const box = el("input", {
@@ -541,7 +587,7 @@ export async function mount(root, ctx) {
             "div",
             { class: "ecm-row-title-wrap" },
             el("a", { class: "ecm-link ecm-row-title", href: `#/sites/${encodeURIComponent(item.slug)}` }, item.name || item.slug),
-            el("span", { class: "ecm-hint ecm-mono" }, item.slug),
+            el("span", { class: "ecm-row-slug ecm-mono" }, item.slug),
           ),
       },
       {
@@ -586,18 +632,14 @@ export async function mount(root, ctx) {
     ];
 
     results.replaceChildren(
-      el(
-        "div",
-        { class: "ecm-card ecm-card-flush" },
-        dataTable({
-          label: "站点列表",
-          columns,
-          rows: visible,
-          onRowClick: (item) => ctx.navigate(`#/sites/${encodeURIComponent(item.slug)}`),
-          getRowAriaLabel: (item) => `打开站点 ${item.name}`,
-          rowClass: (item) => (item.orphan ? "is-orphan" : ""),
-        }),
-      ),
+      dataTable({
+        label: "站点列表",
+        columns,
+        rows: visible,
+        onRowClick: (item) => ctx.navigate(`#/sites/${encodeURIComponent(item.slug)}`),
+        getRowAriaLabel: (item) => `打开站点 ${item.name}`,
+        rowClass: (item) => (item.orphan ? "is-orphan" : ""),
+      }),
     );
   }
 

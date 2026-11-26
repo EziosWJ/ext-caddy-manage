@@ -19,6 +19,7 @@ import {
   pageHeader,
   section,
   statTile,
+  tabs,
   toast,
 } from "../components.js";
 import { fmtBytes, fmtDateTime } from "../format.js";
@@ -167,6 +168,7 @@ export async function mount(root, ctx, route) {
   let data = null;
   let destroyed = false;
   let moduleQuery = "";
+  let activeTab = route.slug ? "site" : "env";
 
   const refreshBtn = button("重新检测", {
     variant: "primary",
@@ -181,23 +183,38 @@ export async function mount(root, ctx, route) {
 
   const header = pageHeader({
     title: "诊断",
-    backHref: "#/overview",
-    backLabel: "概览",
-    actions: [refreshBtn, initBtn],
+    actions: [initBtn, refreshBtn],
   });
-  const content = el("div", { class: "ecm-stack" });
-  page.append(header, siteCheckCard(route.slug), content);
+  const envPanel = el("div", { class: "ecm-stack" });
+  const sitePanel = el("div", { class: "ecm-stack" }, siteCheckCard(route.slug));
+  const modulesPanel = el("div", { class: "ecm-stack" });
+  const tabItems = [
+    { id: "env", label: "环境与配置", icon: "shield-check", panel: envPanel },
+    { id: "site", label: "站点链路检查", icon: "activity", panel: sitePanel },
+    { id: "modules", label: "模块与 DNS-01", icon: "database", panel: modulesPanel },
+  ];
+  const navigation = tabs({
+    items: tabItems,
+    value: activeTab,
+    label: "诊断分区",
+    onChange: (id) => {
+      activeTab = id;
+      for (const item of tabItems) item.panel.hidden = item.id !== id;
+    },
+  });
+  const content = envPanel;
+  page.append(header, navigation.root, envPanel, sitePanel, modulesPanel);
 
   function buildSummary(summary) {
     const s = summary || {};
-    const tiles = el("div", { class: "ecm-tiles" });
+    const tiles = el("div", { class: "ecm-tiles", role: "region", "aria-label": "诊断检查摘要" });
     tiles.append(
       statTile({ label: "正常", value: s.ok ?? 0, tone: "success", icon: "check-circle" }),
       statTile({ label: "警告", value: s.warn ?? 0, tone: "warning", icon: "alert-triangle" }),
       statTile({ label: "错误", value: s.error ?? 0, tone: "danger", icon: "x-circle" }),
       statTile({ label: "未知", value: s.unknown ?? 0, tone: "neutral", icon: "help-circle" }),
     );
-    return section({ title: "检查摘要", children: tiles });
+    return tiles;
   }
 
   function buildChecklist(items) {
@@ -429,23 +446,25 @@ export async function mount(root, ctx, route) {
 
   function render() {
     if (!data) return;
-    content.replaceChildren();
-    content.append(buildSummary(data.summary));
-    content.append(buildChecklist(data.items));
+    envPanel.replaceChildren();
+    envPanel.append(buildSummary(data.summary));
+    envPanel.append(buildChecklist(data.items));
 
     const grid = el("div", { class: "ecm-diag-grid" });
     grid.append(buildConfigCard(data.config));
     grid.append(buildPathsCard(data.paths));
-    content.append(grid);
-    content.append(buildDnsCard(data.dns || {}), buildModulesCard(data.modules));
-    content.append(buildValidateCard(data.validate));
+    envPanel.append(grid);
+    envPanel.append(buildValidateCard(data.validate));
+
+    modulesPanel.replaceChildren(buildDnsCard(data.dns || {}), buildModulesCard(data.modules));
 
     ctx.setTitle("诊断");
   }
 
   async function load() {
     refreshBtn.disabled = true;
-    content.replaceChildren(loadingBlock("正在执行诊断…"));
+    envPanel.replaceChildren(loadingBlock("正在执行诊断…"));
+    modulesPanel.replaceChildren(loadingBlock("正在读取模块信息…"));
     try {
       const result = await api.diagnostics();
       if (destroyed) return;
@@ -453,9 +472,9 @@ export async function mount(root, ctx, route) {
       render();
     } catch (error) {
       if (destroyed) return;
-      content.replaceChildren(
-        errorBlock(error, { title: "诊断加载失败", onRetry: () => load() }),
-      );
+      const errNode = errorBlock(error, { title: "诊断加载失败", onRetry: () => load() });
+      envPanel.replaceChildren(errNode);
+      modulesPanel.replaceChildren(errorBlock(error, { title: "模块信息加载失败", onRetry: () => load() }));
     } finally {
       if (!destroyed) refreshBtn.disabled = false;
     }
