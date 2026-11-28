@@ -4,7 +4,7 @@
   <p><strong>Caddy, managed safely from your browser.</strong></p>
   <p>A self-hosted Caddy reverse proxy and site management panel, delivered as an Extension Host / GoDesk extension.</p>
   <p>
-    <a href="https://github.com/EziosWJ/ext-caddy-manage/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/release-v0.1.0-blue" alt="Latest release"></a>
+    <a href="https://github.com/EziosWJ/ext-caddy-manage/releases/tag/v0.1"><img src="https://img.shields.io/badge/release-v0.1-blue" alt="Latest release"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
     <a href="https://github.com/EziosWJ/Extension-Host"><img src="https://img.shields.io/badge/Extension_Host-%3E%3D0.1.0-blueviolet" alt="Extension Host >= 0.1.0"></a>
     <a href="https://github.com/EziosWJ/ext-caddy-manage"><img src="https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black" alt="Linux"></a>

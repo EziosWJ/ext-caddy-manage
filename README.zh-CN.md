@@ -4,7 +4,7 @@
   <p><strong>在浏览器里，安全地管理 Caddy。</strong></p>
   <p>一个自托管的 Caddy 反向代理与站点管理面板，以 Extension Host / GoDesk 插件形式运行。</p>
   <p>
-    <a href="https://github.com/EziosWJ/ext-caddy-manage/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/release-v0.1.0-blue" alt="最新版本"></a>
+    <a href="https://github.com/EziosWJ/ext-caddy-manage/releases/tag/v0.1"><img src="https://img.shields.io/badge/release-v0.1-blue" alt="最新版本"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
     <a href="https://github.com/EziosWJ/Extension-Host"><img src="https://img.shields.io/badge/Extension_Host-%3E%3D0.1.0-blueviolet" alt="Extension Host >= 0.1.0"></a>
     <a href="https://github.com/EziosWJ/ext-caddy-manage"><img src="https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black" alt="Linux"></a>
