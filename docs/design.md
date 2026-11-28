@@ -39,7 +39,7 @@
   - 站点片段：`/opt/caddy/config/conf.d/*.caddy`，停用片段在 `conf.d.disabled/`
   - 站点根目录：`/opt/caddy/sites/<slug>/`
   - Caddy 状态：`/var/lib/caddy`（Caddy 私有，插件不读）
-  - 插件数据（宿主管理）：`<宿主 data-dir>/plugins/cn.ezios.ecm/data`
+  - 插件数据（宿主管理）：`<宿主 data-dir>/plugins/de.jianwang.caddy-manage/data`
 - 账号：Caddy 以专用 `caddy` 用户运行；配置与站点目录属宿主账号，权限 0755/0644，Caddy 只读。
 - 日志：Caddy 运行时日志与访问日志统一写 stderr，由 journald 收集。宿主账号加入 `systemd-journal` 组；unit 关闭 journald 限流（`LogRateLimitBurst=0`），避免高流量时访问日志被丢弃。
 - 服务控制：启动、停止与重启通过 `host.services` 传入 `{ sudo = true }`，查询与日志使用宿主账号。非 root 宿主的提权规则由系统管理员配置，示例见 `deploy/sudoers.example`。
@@ -84,7 +84,7 @@ WantedBy=multi-user.target
 - `host.config.get/all`：读取 manifest 配置，热生效。
 - `host.app.emit` / `/extensions/<id>/events`：v1 不使用，日志跟随由前端轮询。
 
-插件为纯 Lua（Lua 与原生入口不能共存）。manifest 需要新增 `minHostVersion`，取包含 `host.process.exec` 与 `host.services` 新动作的宿主版本（宿主发布后填写）。
+插件为纯 Lua（Lua 与原生入口不能共存）。manifest 的 `minHostVersion` 为 `0.1.0`，对应包含 `host.process.exec`、`host.services` 与 `host.schedule` 能力的宿主版本。
 
 ## 4. 插件配置（manifest.config）
 

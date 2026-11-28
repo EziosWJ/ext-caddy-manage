@@ -1,12 +1,27 @@
 {
   "schemaVersion": 1,
-  "id": "cn.ezios.ecm",
-  "name": "Caddy 管理",
-  "version": "0.4.0",
-  "minHostVersion": "0.3.0",
+  "id": "de.jianwang.caddy-manage",
+  "name": "Caddy Manager",
+  "version": "0.1.0",
+  "minHostVersion": "0.1.0",
   "hostApi": {
     "min": 1,
     "max": 1
+  },
+  "description": "Self-hosted Caddy reverse proxy and site management panel with safe config validation.",
+  "author": {
+    "name": "Jian Wang",
+    "url": "https://jianwang.de"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/EziosWJ/ext-caddy-manage",
+  "icon": "web/icon.svg",
+  "categories": ["proxy", "ops"],
+  "keywords": ["caddy", "reverse-proxy", "tls", "web-server"],
+  "requirements": {
+    "os": ["linux"],
+    "commands": ["caddy", "openssl", "curl"],
+    "systemd": true
   },
   "entry": {
     "web": "web/index.html",
@@ -15,48 +30,110 @@
   "config": {
     "caddyBinary": {
       "type": "string",
-      "default": "/opt/caddy/caddy"
+      "default": "/opt/caddy/caddy",
+      "label": "Caddy Binary",
+      "description": "Absolute path to the Caddy executable used to validate and reload configurations."
     },
     "mainConfig": {
       "type": "string",
-      "default": "/opt/caddy/config/Caddyfile"
+      "default": "/opt/caddy/config/Caddyfile",
+      "label": "Main Caddyfile",
+      "description": "Absolute path to the main Caddyfile, which imports the site snippets."
     },
     "snippetDir": {
       "type": "string",
-      "default": "/opt/caddy/config/conf.d"
+      "default": "/opt/caddy/config/conf.d",
+      "label": "Site Snippet Directory",
+      "description": "Absolute path to the directory containing active site Caddyfile snippets."
     },
     "sitesRoot": {
       "type": "string",
-      "default": "/opt/caddy/sites"
+      "default": "/opt/caddy/sites",
+      "label": "Sites Root Directory",
+      "description": "Absolute path to the parent directory used for new static site roots."
     },
     "serviceUnit": {
       "type": "string",
-      "default": "caddy.service"
+      "default": "caddy.service",
+      "label": "Systemd Service Unit",
+      "description": "Name of the Caddy systemd service unit used for status, service actions, and journal logs."
     },
     "logLines": {
       "type": "number",
       "format": "integer",
       "default": 500,
       "min": 100,
-      "max": 2000
+      "max": 2000,
+      "label": "Default Log Lines",
+      "description": "Default number of recent log lines to read per request (100–2000)."
     },
     "certProbeHours": {
       "type": "number",
       "format": "integer",
       "default": 6,
       "min": 1,
-      "max": 168
+      "max": 168,
+      "label": "Certificate Probe Cache Duration",
+      "description": "Number of hours to cache TLS certificate probe results (1–168)."
     },
     "metricsPeriodic": {
       "type": "boolean",
-      "default": false
+      "default": false,
+      "label": "Periodic Metrics Snapshots",
+      "description": "Collect a runtime metrics snapshot every 60 seconds when enabled."
     },
     "backupKeep": {
       "type": "number",
       "format": "integer",
       "default": 100,
       "min": 10,
-      "max": 1000
+      "max": 1000,
+      "label": "Backup Retention Count",
+      "description": "Maximum number of configuration backups to retain (10–1000)."
+    }
+  },
+  "locales": {
+    "zh-CN": {
+      "name": "Caddy 管理",
+      "description": "自托管的 Caddy 运维面板，提供站点表单、配置校验、证书探测与安全热重载。",
+      "config": {
+        "caddyBinary": {
+          "label": "Caddy 可执行文件",
+          "description": "用于校验和热重载配置的 Caddy 可执行文件的绝对路径。"
+        },
+        "mainConfig": {
+          "label": "主 Caddyfile",
+          "description": "用于导入各站点配置片段的主 Caddyfile 的绝对路径。"
+        },
+        "snippetDir": {
+          "label": "站点片段目录",
+          "description": "存放已启用站点的 Caddyfile 配置片段的目录绝对路径。"
+        },
+        "sitesRoot": {
+          "label": "站点根目录",
+          "description": "新建静态站点根目录所在的父目录的绝对路径。"
+        },
+        "serviceUnit": {
+          "label": "systemd 服务单元",
+          "description": "Caddy 的 systemd 服务单元名称，用于查询状态、管理服务和读取日志。"
+        },
+        "logLines": {
+          "label": "默认日志行数",
+          "description": "每次请求默认读取的最近日志行数（100–2000）。"
+        },
+        "certProbeHours": {
+          "label": "证书探测缓存时长",
+          "description": "TLS 证书探测结果的缓存时长，以小时为单位（1–168）。"
+        },
+        "metricsPeriodic": {
+          "label": "定期采集运行指标",
+          "description": "启用后每 60 秒采集一次运行指标快照。"
+        },
+        "backupKeep": {
+          "label": "备份保留数量",
+          "description": "保留配置备份的最大数量（10–1000）。"
+        }
+      }
     }
   }
 }

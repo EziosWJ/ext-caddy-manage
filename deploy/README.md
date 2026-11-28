@@ -2,13 +2,13 @@
 
 本手册面向部署 Extension Host（或 GoDesk）与 Caddy 的运维者，说明如何准备系统账号、目录权限、systemd、journald 与 sudoers，以及如何安装、配置、验证和升级本插件。
 
-插件 id 为 `cn.ezios.ecm`。`deploy/install.sh` 准备 Caddy 账号、目录和 systemd unit。系统管理员负责配置 sudoers。
+插件 id 为 `de.jianwang.caddy-manage`。`deploy/install.sh` 准备 Caddy 账号、目录和 systemd unit。系统管理员负责配置 sudoers。
 
 ## 1. 部署拓扑
 
 ```text
 浏览器 ──> Extension Host（宿主账号，如 godesk）
-              │  └─ 插件 cn.ezios.ecm（纯 Lua）
+              │  └─ 插件 de.jianwang.caddy-manage（纯 Lua）
               │       ├─ host.process.exec ──> /opt/caddy/caddy
               │       │     version / list-modules / validate / reload / fmt / hash-password
               │       └─ host.services ──> systemctl（查询使用宿主账号，启停和重启可经 sudo 提权）
@@ -30,7 +30,7 @@ Caddy（caddy 账号）── 只读 /opt/caddy/config 与 /opt/caddy/sites
 - 运行 Extension Host 的账号已存在（示例使用 `godesk`），并且是未来写入配置的属主。
 - Caddy 使用官方 GitHub Release 的静态二进制，版本 ≥ 2.8（推荐 2.10.x），安装到 `/opt/caddy/caddy`，不使用 apt 包。
 - 宿主账号可执行 `sudo`（非 root 运行时）；80/443 端口空闲。
-- Extension Host 需支持 `host.services` 的 `sudo` 选项，宿主源码当前版本为 0.3.0。
+- Extension Host ≥ 0.1.0，并支持 `host.services` 的 `sudo` 选项。
 - 插件包不包含 `deploy/` 与 `scripts/`（`ext pkg` 只打包 `manifest.json`、`web/`、`lua/`、`native/`），部署产物需要在仓库目录中执行。
 
 ## 3. 快速安装
@@ -125,7 +125,7 @@ sudo systemctl daemon-reload
 | `/var/lib/caddy` | caddy:caddy | 0750 | Caddy 私有状态，插件不读 |
 | `/etc/systemd/system/caddy.service` | root:root | 0644 | systemd unit |
 | `/etc/sudoers.d/ext-caddy-manage` | root:root | 0440 | 提权规则 |
-| `<宿主 data-dir>/plugins/cn.ezios.ecm/data` | 宿主账号 | 0700 | 插件数据目录（宿主创建） |
+| `<宿主 data-dir>/plugins/de.jianwang.caddy-manage/data` | 宿主账号 | 0700 | 插件数据目录（宿主创建） |
 | `<data>/backups` | 宿主账号 | 0700 | 备份，文件 0600 |
 
 权限原则：
@@ -217,7 +217,7 @@ sudo -n -k -u root -- /usr/bin/systemctl start --no-ask-password -- caddy.servic
 
 ```sh
 ext pkg
-# 生成 dist/cn.ezios.ecm-0.1.0.zip
+# 生成 dist/de.jianwang.caddy-manage-0.1.0.zip
 ```
 
 安装：
@@ -270,7 +270,7 @@ ext pkg
 
 ```sh
 # 插件健康检查（路径按实际监听地址）
-curl -sS http://127.0.0.1:5001/extensions/cn.ezios.ecm/api/health
+curl -sS http://127.0.0.1:5001/extensions/de.jianwang.caddy-manage/api/health
 
 # Caddy 配置与运行状态
 /opt/caddy/caddy validate --config /opt/caddy/config/Caddyfile --adapter caddyfile
@@ -286,7 +286,7 @@ curl -sS -H 'Host: example.com' http://127.0.0.1/
 
 备份：
 
-- 位置：`<宿主 data-dir>/plugins/cn.ezios.ecm/data/backups/`。
+- 位置：`<宿主 data-dir>/plugins/de.jianwang.caddy-manage/data/backups/`。
 - 文件名：`<UTC 时间戳Z>--<原因>--<原文件名>`，例如 `20261125T060000Z--form--blog.caddy`。
 - 原因区分作用域：主配置使用 `global`、`init`、`restore-global`；站点使用 `create`、`form`、`raw`、`enable`、`disable`、`delete`、`restore`。即使主配置与站点片段同名（例如主配置叫 `blog.caddy`），备份列表与恢复也不会混淆。
 - 触发：表单/原文保存、启用、停用、删除、恢复、主配置保存、初始化覆盖。
@@ -304,7 +304,7 @@ sudo systemctl restart caddy.service
 
 升级前建议备份 `/opt/caddy/config` 与插件数据目录。插件会执行 `caddy validate`，发现不兼容会拒绝写入。
 
-升级独立 Extension Host 上的插件时，先记录当前 Host 插件配置，并备份宿主数据、Caddyfile 与片段。重新打包后，在 `/host/` 卸载旧版本时保留业务数据，安装新 ZIP，在启用前恢复插件配置。Host 0.3.0 重新安装时会把插件设置重置为 Manifest 默认值。保留业务数据可让新版本继续读取原来的站点快照和配置备份。核对路径、服务单元、日志行数、证书探测周期及备份保留数后，再执行一次配置预览与加载。
+升级独立 Extension Host 上的插件时，先记录当前 Host 插件配置，并备份宿主数据、Caddyfile 与片段。重新打包后，在 `/host/` 安装新 ZIP，并在启用前确认插件配置。保留业务数据可让新版本继续读取原来的站点快照和配置备份。核对路径、服务单元、日志行数、证书探测周期及备份保留数后，再执行一次配置预览与加载。
 
 卸载：
 
@@ -351,7 +351,7 @@ sudo systemctl restart caddy.service
 
 ## DNS-01
 
-V0.2 在诊断页显示完整模块 ID 和检测结果。如生产环境使用系统服务，核对诊断中的磁盘构建和运行构建。服务权限阻止比较时，管理员可比对 `systemctl show -p MainPID --value caddy.service` 所得 PID 的 `/proc/<PID>/exe` 与 `caddyBinary` 的校验和，并分别执行 `list-modules`。二进制替换后需由服务重新启动才能切换运行构建。
+诊断页显示完整模块 ID 和检测结果。如生产环境使用系统服务，核对诊断中的磁盘构建和运行构建。服务权限阻止比较时，管理员可比对 `systemctl show -p MainPID --value caddy.service` 所得 PID 的 `/proc/<PID>/exe` 与 `caddyBinary` 的校验和，并分别执行 `list-modules`。二进制替换后需由服务重新启动才能切换运行构建。
 
 | 模块 ID | 最小权限评估 |
 | --- | --- |

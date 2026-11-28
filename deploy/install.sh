@@ -268,7 +268,7 @@ cat <<EOF
 
 4. 安装并启用本插件（在项目根目录）：
      ext pkg
-   然后在宿主的 /host/ 安装 dist/cn.ezios.ecm-0.1.0.zip 并启用。
+   然后在宿主的 /host/ 安装 dist/de.jianwang.caddy-manage-<版本>.zip 并启用。
 
 5. 检查插件配置（宿主扩展配置表单，保存后热生效）：
      caddyBinary   $CADDY_TARGET

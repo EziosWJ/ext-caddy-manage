@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""V0.4 ZIP acceptance on standalone Extension Host and stock Caddy."""
+"""Diagnostics and resource acceptance for the current package.
+
+Installs ``de.jianwang.caddy-manage-<version>.zip`` on a standalone Extension
+Host with a stock Caddy, reinstalls the same package to confirm data survives a
+self-upgrade, then exercises diagnostics, backups, metrics, journal windows and
+reload rollback. ``--resources`` additionally measures snapshot expiry and
+60-second periodic collection.
+"""
 
 import argparse
 import contextlib
@@ -7,23 +14,16 @@ import http.server
 import json
 import os
 from pathlib import Path
-import runpy
 import socket
+import subprocess
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 
-HARNESS = runpy.run_path(str(Path(__file__).with_name("e2e-v02.py")))
-PLUGIN = HARNESS["PLUGIN"]
-free_ports, process, wait_health = (HARNESS[name] for name in ("free_ports", "process", "wait_health"))
-
-
-def rss(pid):
-    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-        if line.startswith("VmRSS:"):
-            return int(line.split()[1])
+PLUGIN = "de.jianwang.caddy-manage"
+VERSION = json.loads((Path(__file__).resolve().parent.parent / "manifest.json").read_text())["version"]
 
 
 class Upstream(http.server.BaseHTTPRequestHandler):
@@ -41,6 +41,47 @@ class Upstream(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def free_ports(count):
+    with contextlib.ExitStack() as stack:
+        sockets = [stack.enter_context(socket.socket()) for _ in range(count)]
+        for sock in sockets:
+            sock.bind(("127.0.0.1", 0))
+        return [sock.getsockname()[1] for sock in sockets]
+
+
+def process(stack, argv, log, **options):
+    with log.open("wb") as output:
+        child = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT, **options)
+
+    def stop():
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+    stack.callback(stop)
+    return child
+
+
+def wait_health(check):
+    for _ in range(100):
+        try:
+            if check() is not False:
+                return
+        except (OSError, AssertionError):
+            time.sleep(0.1)
+    raise AssertionError("待测服务未启动")
+
+
+def rss(pid):
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+
+
 def backend(stack, status=200, delay=0, size=0):
     server = stack.enter_context(http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream))
     server.status, server.delay, server.size = status, delay, size
@@ -50,7 +91,7 @@ def backend(stack, status=200, delay=0, size=0):
 
 
 def run(args, work, stack):
-    host_port, admin, old_port, proxy_port, tls_port, dns_port, slow_site, pending_port, disabled_admin, split_port = free_ports(10)
+    host_port, admin, baseline_port, proxy_port, tls_port, dns_port, slow_site, pending_port, disabled_admin, split_port = free_ports(10)
     host_url = f"http://127.0.0.1:{host_port}"
     extension = f"/api/v1/extensions/{PLUGIN}"
     prefix = f"/extensions/{PLUGIN}"
@@ -85,11 +126,11 @@ def run(args, work, stack):
     conf, sites, programs = (work / name for name in ("conf.d", "sites", "programs"))
     for directory in (conf, sites, programs):
         directory.mkdir()
-    (sites / "index.html").write_text("V0.4")
+    (sites / "index.html").write_text("diagnostics")
     main = work / "Caddyfile"
     base = (
         "# >>> ext-caddy-manage:global\n{\n"
-        f"\tadmin 127.0.0.1:{admin}\n\thttp_port {old_port}\n"
+        f"\tadmin 127.0.0.1:{admin}\n\thttp_port {baseline_port}\n"
         "\tskip_install_trust\n\tmetrics\n"
         "}\n# <<< ext-caddy-manage:global\nimport conf.d/*.caddy\n"
     )
@@ -132,8 +173,8 @@ def run(args, work, stack):
     config = dict(caddyBinary=args.caddy, mainConfig=str(main), snippetDir=str(conf), sitesRoot=str(sites),
                   logLines=231, certProbeHours=17, backupKeep=23)
 
-    def install(package, version):
-        assert request("POST", "/api/v1/extensions", package, 201)["version"] == version
+    def install(package):
+        assert request("POST", "/api/v1/extensions", package, 201)["version"] == VERSION
         request("PUT", extension + "/config", config)
         request("POST", extension + "/enable")
 
@@ -151,18 +192,20 @@ def run(args, work, stack):
         assert [step["id"] for step in result["steps"]] == ["dns", "listen", "tls", "upstream", "http", "config"]
         return result
 
-    install(args.previous_zip, "0.3.0")
-    old = post("/site", {"model": dict(name="Legacy", domains=["localhost"], https=False,
-                                      type="static", static=dict(root=str(sites)))})
-    old = post("/site/update", {"slug": old["slug"], "baseline": old["raw"], "model": dict(old["model"], note="baseline")})
-    backup = old["backups"][0]["name"]
+    install(args.zip)
+    baseline = post("/site", {"model": dict(name="Baseline", domains=["localhost"], https=False,
+                                           type="static", static=dict(root=str(sites)))})
+    baseline = post("/site/update", {"slug": baseline["slug"], "baseline": baseline["raw"],
+                                    "model": dict(baseline["model"], note="baseline")})
+    backup = baseline["backups"][0]["name"]
+    print(f"重新安装同一 {VERSION} 包，验证站点快照、备份与配置保留", flush=True)
     request("DELETE", extension, status=204)
-    install(args.current_zip, "0.4.0")
-    assert get("/site?slug=" + old["slug"])["raw"] == old["raw"]
+    install(args.zip)
+    assert get("/site?slug=" + baseline["slug"])["raw"] == baseline["raw"]
     assert get("/backup?name=" + backup)["content"]
     assert get("/health")["logLines"] == 231
     assert get("/metrics") == {"status": "uncollected"}
-    wait_health(lambda: check(old)["target"] == f"127.0.0.1:{old_port}")
+    wait_health(lambda: check(baseline)["target"] == f"127.0.0.1:{baseline_port}")
     proxy = publish("Proxy", proxy_port, upstream=backend(stack, status=503))
     tls = publish("Internal TLS", tls_port, "::1", "internal")
     dns = publish("Unresolved", dns_port, "ecm-unknown.invalid")
@@ -223,11 +266,11 @@ def run(args, work, stack):
         access(1, "localhost", 200, .010, "/other"),
         access(2, matching, 404, .025, "/missing"),
         access(3, matching, 503, .125, "/failed"),
-        access(4, f"127.0.0.1:{old_port}", 500, 1, "/foreign"),
+        access(4, f"127.0.0.1:{baseline_port}", 500, 1, "/foreign"),
         access(5, matching, 500, 1, "/named", "http.log.access.another"),
         access(6, matching, 200, .150, "/ok"),
-        access(7, f"localhost:{old_port}", 200, .010, "/legacy"),
-        access(8, f"localhost:{proxy_port}", 200, .010, "/foreign-legacy"),
+        access(7, f"localhost:{baseline_port}", 200, .010, "/baseline"),
+        access(8, f"localhost:{proxy_port}", 200, .010, "/foreign-baseline"),
     ]
     fixture.write_text("\n".join(lines) + "\n")
     logs_url = f"/logs/site?slug={proxy['slug']}&lines=100"
@@ -241,8 +284,8 @@ def run(args, work, stack):
         filtered = get(logs_url + f"&statusClass={category}")
         assert filtered["summary"] == summary and [row["uri"] for row in filtered["entries"]] == [uri]
     assert not get(logs_url + "&status=503&q=missing")["entries"]
-    legacy_logs = get(f"/logs/site?slug={old['slug']}&lines=100")
-    assert [row["uri"] for row in legacy_logs["entries"]] == ["/other", "/legacy"]
+    baseline_logs = get(f"/logs/site?slug={baseline['slug']}&lines=100")
+    assert [row["uri"] for row in baseline_logs["entries"]] == ["/other", "/baseline"]
     assert len(reads.read_text().splitlines()) == 1
     fixture.write_text("\n".join([lines[1]] * 100) + "\n")
     assert get(logs_url.replace("100", "101"))["summary"]["journalLines"] == 100
@@ -298,7 +341,7 @@ def run(args, work, stack):
     assert after_rollback["status"] == "ok" and after_rollback["handlers"], after_rollback
 
     fixture.write_text("\n".join(lines) + "\n")
-    print(f"PASS V0.4 functional ZIP acceptance. Browser URL {host_url}{prefix}/web/", flush=True)
+    print(f"PASS diagnostics ZIP acceptance. Browser URL {host_url}{prefix}/web/", flush=True)
     print(f"Browser sites: proxy={proxy['slug']}, TLS={tls['slug']}", flush=True)
     if args.resources:
         print("验证 90 秒过期与 60 秒周期采集", flush=True)
@@ -340,12 +383,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--caddy", required=True)
     parser.add_argument("--host", default="ext")
-    parser.add_argument("--previous-zip", type=Path, required=True)
-    parser.add_argument("--current-zip", type=Path, required=True)
+    parser.add_argument("--zip", type=Path, default=Path("dist") / f"{PLUGIN}-{VERSION}.zip")
     parser.add_argument("--resources", action="store_true", help="measure real expiry and 60-second collection")
     parser.add_argument("--serve", action="store_true", help="leave the fixture available for browser checks")
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="ecm-v04-accept-") as directory, contextlib.ExitStack() as stack:
+    with tempfile.TemporaryDirectory(prefix="ecm-diag-accept-") as directory, contextlib.ExitStack() as stack:
         work = Path(directory)
         try:
             run(args, work, stack)

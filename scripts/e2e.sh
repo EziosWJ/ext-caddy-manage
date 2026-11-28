@@ -358,7 +358,7 @@ say "Caddy：$("$CADDY" version | awk 'NR==1{print $1}')"
 
 # ---------------------------------------------------------------- 启动宿主
 
-API_BASE="http://127.0.0.1:$HOST_PORT/extensions/cn.ezios.ecm/api"
+API_BASE="http://127.0.0.1:$HOST_PORT/extensions/de.jianwang.caddy-manage/api"
 HOST_BASE="http://127.0.0.1:$HOST_PORT"
 
 say "打包并启动 Extension Host 与插件（ext run）"
@@ -393,7 +393,7 @@ json.dump({
 PY
 HTTP_STATUS=$(curl --noproxy '*' -sS --max-time 30 -o "$RESP" -w '%{http_code}' \
   -X PUT -H 'Content-Type: application/json' --data-binary "@$WORK/body.json" \
-  "$HOST_BASE/api/v1/extensions/cn.ezios.ecm/config") || true
+  "$HOST_BASE/api/v1/extensions/de.jianwang.caddy-manage/config") || true
 assert_status 200 "插件配置保存失败：$(head -c 2000 "$RESP" 2>/dev/null || true)"
 
 # ---------------------------------------------------------------- 初始化
@@ -926,7 +926,7 @@ PY
 BACKUP_NAME=$(cat "$WORK/backup-name.txt")
 [[ -n "$BACKUP_NAME" ]] || fail "备份名称为空"
 export BACKUP_NAME
-BACKUP_FILE="$WORK/host-data/plugins/cn.ezios.ecm/data/backups/$BACKUP_NAME"
+BACKUP_FILE="$WORK/host-data/plugins/de.jianwang.caddy-manage/data/backups/$BACKUP_NAME"
 [[ -f "$BACKUP_FILE" ]] || fail "备份文件不存在：$BACKUP_FILE"
 [[ $(stat -c '%a' "$BACKUP_FILE") == "600" ]] || fail "备份文件权限不是 0600"
 [[ $(stat -c '%a' "$(dirname "$BACKUP_FILE")") == "700" ]] || fail "备份目录权限不是 0700"

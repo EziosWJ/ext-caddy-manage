@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Caddy Manager</title>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#12304a"/>
+  <path d="M14 32h9m9 0h4c5 0 5-12 10-12h4M36 32c5 0 5 12 10 12h4"
+        fill="none" stroke="#68dfc3" stroke-linecap="round" stroke-width="4"/>
+  <g fill="#fff">
+    <circle cx="14" cy="32" r="3"/>
+    <rect x="23" y="26" width="12" height="12" rx="3"/>
+    <circle cx="50" cy="20" r="3"/>
+    <circle cx="50" cy="44" r="3"/>
+  </g>
+</svg>
